@@ -38,7 +38,7 @@ from .colour import Color, Colour
 from .invite import Invite
 from .object import Object
 from .reaction import Reaction
-from . import utils, opus, abc
+from . import utils, opus, abc, rtp
 from .enums import *
 from .embeds import Embed
 from .shard import AutoShardedClient
