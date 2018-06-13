@@ -42,7 +42,7 @@ from .invite import Invite, PartialInviteChannel, PartialInviteGuild
 from .widget import Widget, WidgetMember, WidgetChannel
 from .object import Object
 from .reaction import Reaction
-from . import utils, opus, abc
+from . import utils, opus, abc, rtp
 from .enums import *
 from .embeds import Embed
 from .shard import AutoShardedClient
