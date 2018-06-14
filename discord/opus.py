@@ -43,7 +43,11 @@ _lib = None
 class EncoderStruct(ctypes.Structure):
     pass
 
+class DecoderStruct(ctypes.Structure):
+    pass
+
 EncoderStructPtr = ctypes.POINTER(EncoderStruct)
+DecoderStructPtr = ctypes.POINTER(EncoderStruct)
 
 def _err_lt(result, func, args):
     if result < 0:
@@ -76,6 +80,26 @@ exported_functions = [
         None, ctypes.c_int32, _err_lt),
     ('opus_encoder_destroy',
         [EncoderStructPtr], None, None),
+
+    ('opus_decoder_get_size',
+        [ctypes.c_int], ctypes.c_int, None),
+    ('opus_decoder_create',
+        [ctypes.c_int, ctypes.c_int, c_int_ptr], DecoderStructPtr, _err_ne),
+    ('opus_packet_get_bandwidth',
+        [ctypes.c_char_p], ctypes.c_int, _err_lt),
+    ('opus_packet_get_nb_channels',
+        [ctypes.c_char_p], ctypes.c_int, _err_lt),
+    ('opus_packet_get_nb_frames',
+        [ctypes.c_char_p, ctypes.c_int], ctypes.c_int, _err_lt),
+    ('opus_packet_get_samples_per_frame',
+        [ctypes.c_char_p, ctypes.c_int], ctypes.c_int, _err_lt),
+    ('opus_decoder_get_nb_samples',
+        [DecoderStructPtr, ctypes.c_char_p, ctypes.c_int32], ctypes.c_int, _err_lt),
+    ('opus_decode',
+        [DecoderStructPtr, ctypes.c_char_p, ctypes.c_int32, c_int16_ptr, ctypes.c_int, ctypes.c_int],
+        ctypes.c_int, _err_lt),
+    ('opus_decoder_destroy',
+        [DecoderStructPtr], None, None)
 ]
 
 def libopus_loader(name):
@@ -98,7 +122,7 @@ def libopus_loader(name):
             if item[3]:
                 func.errcheck = item[3]
         except KeyError:
-            log.exception("Error assigning check function to %s", func)
+            log.info("Error assigning check function to %s", item[0])
 
     return lib
 
@@ -114,6 +138,7 @@ def _load_default():
             _lib = libopus_loader(ctypes.util.find_library('opus'))
     except Exception:
         _lib = None
+        log.warning("Unable to load opus lib, %s", e)
 
     return _lib is not None
 
@@ -280,3 +305,68 @@ class Encoder:
         ret = _lib.opus_encode(self._state, pcm, frame_size, data, max_data_bytes)
 
         return array.array('b', data[:ret]).tobytes()
+
+class Decoder:
+    SAMPLING_RATE = 48000
+    CHANNELS = 2
+    FRAME_LENGTH = 20
+    SAMPLE_SIZE = 4
+    SAMPLES_PER_FRAME = int(SAMPLING_RATE / 1000 * FRAME_LENGTH)
+
+    FRAME_SIZE = SAMPLES_PER_FRAME * SAMPLE_SIZE
+
+    def __init__(self, application=APPLICATION_VOIP):
+        self.application = application
+
+        if not is_loaded():
+            raise OpusNotLoaded()
+
+        self._state = self._create_state()
+
+    def __del__(self):
+        if hasattr(self, '_state'):
+            _lib.opus_decoder_destroy(self._state)
+            self._state = None
+
+    def _create_state(self):
+        ret = ctypes.c_int()
+        return _lib.opus_decoder_create(self.SAMPLING_RATE, self.CHANNELS, ctypes.byref(ret))
+
+    @classmethod
+    def _packet_get_nb_frames(cls, data):
+        """Gets the number of frames in an Opus packet"""
+        return _lib.opus_packet_get_nb_frames(data, len(data))
+
+    @classmethod
+    def _packet_get_nb_channels(cls, data):
+        """Gets the number of channels in an Opus packet"""
+        return _lib.opus_packet_get_nb_channels(data)
+
+    def _packet_get_samples_per_frame(self, data):
+        """Gets the number of samples per frame from an Opus packet"""
+        return _lib.opus_packet_get_samples_per_frame(data, self.SAMPLING_RATE)
+
+    def decode(self, data, decode_fec=False):
+        if data is None:
+            frame_size = 960 # somewhat of a hack, will fix later
+            dlen = 0
+        else:
+            dlen = len(data)
+            frames = self._packet_get_nb_frames(data)
+            samples_per_frame = self._packet_get_samples_per_frame(data)
+
+            channels = self._packet_get_nb_channels(data)
+            frame_size = frames * samples_per_frame
+
+        pcm_size = frame_size * self.CHANNELS
+        pcm = (ctypes.c_int16 * pcm_size)()
+        pcm_ptr = ctypes.cast(pcm, ctypes.POINTER(ctypes.c_int16))
+
+        # try block is only temp
+        try:
+            result = _lib.opus_decode(self._state, data, dlen, pcm_ptr, frame_size, decode_fec)
+        except:
+            print("decode error %s (%s)" % (result, len(pcm)))
+            raise
+
+        return array.array('h', pcm).tobytes()
