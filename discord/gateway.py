@@ -235,6 +235,9 @@ class DiscordWebSocket(websockets.client.WebSocketClientProtocol):
         else:
             return ws
 
+    def _dispatch(self, *args):
+        self._connection._state.dispatch(*args)
+
     def wait_for(self, event, predicate, result=None):
         """Waits for a DISPATCH'd event that meets the predicate.
 
@@ -392,6 +395,9 @@ class DiscordWebSocket(websockets.client.WebSocketClientProtocol):
             self._trace = trace = data.get('_trace', [])
             log.info('Shard ID %s has successfully RESUMED session %s under trace %s.',
                      self.shard_id, self.session_id, ', '.join(trace))
+
+        elif event == 'VOICE_STATE_UPDATE':
+            pass
 
         parser = 'parse_' + event.lower()
 
@@ -653,6 +659,20 @@ class DiscordVoiceWebSocket(websockets.client.WebSocketClientProtocol):
             await self.identify()
         elif op == self.SESSION_DESCRIPTION:
             await self.load_secret_key(data)
+        elif op == self.SPEAKING:
+            user_id = int(data['user_id'])
+            ssrc = int(data['ssrc'])
+
+            vc = self._connection
+            vc._ssrcs[ssrc] = user_id
+
+            if vc.guild:
+                user = vc.guild.get_member(user_id)
+            else:
+                user = vc._state.get_user(user_id)
+
+            self._dispatch('voice_speaking_update', user, data['speaking'])
+
 
     async def initial_connection(self, data):
         state = self._connection

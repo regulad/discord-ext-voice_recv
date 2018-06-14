@@ -108,6 +108,7 @@ class VoiceClient:
         self._runner = None
         self._player = None
         self.encoder = opus.Encoder()
+        self._ssrcs - Bidict()
 
     warn_nacl = not has_nacl
 
