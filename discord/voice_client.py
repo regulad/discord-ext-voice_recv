@@ -108,7 +108,7 @@ class VoiceClient:
         self._runner = None
         self._player = None
         self.encoder = opus.Encoder()
-        self._ssrcs - Bidict()
+        self._ssrcs = Bidict()
 
     warn_nacl = not has_nacl
 
@@ -287,7 +287,7 @@ class VoiceClient:
 
     # audio related
 
-    def _get_voice_packet(self, data):
+    def _encrypt_voice_packet(self, data):
         header = bytearray(12)
         nonce = bytearray(24)
         box = nacl.secret.SecretBox(bytes(self.secret_key))
@@ -304,6 +304,18 @@ class VoiceClient:
 
         # Encrypt and return the data
         return header + box.encrypt(bytes(data), bytes(nonce)).ciphertext
+
+    def _decrypt_voice_packet(self, packet):
+        nonce = bytearray(24)
+        nonce[:12] = packet.header
+        box = nacl.secret.SecretBox(bytes(self.secret_key))
+        data = box.decrypt(bytes(packet.data), bytes(nonce))
+
+        if packet.extended:
+            offset = packet.update_ext_headers(data)
+            data = data[offset:]
+
+        return data
 
     def play(self, source, *, after=None):
         """Plays an :class:`AudioSource`.
@@ -411,7 +423,7 @@ class VoiceClient:
             encoded_data = self.encoder.encode(data, self.encoder.SAMPLES_PER_FRAME)
         else:
             encoded_data = data
-        packet = self._get_voice_packet(encoded_data)
+        packet = self._encrypt_voice_packet(encoded_data)
         try:
             self.socket.sendto(packet, (self.endpoint_ip, self.voice_port))
         except BlockingIOError:
