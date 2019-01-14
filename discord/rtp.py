@@ -34,6 +34,7 @@ log = logging.getLogger(__name__)
 
 __all__ = ['decode', 'RTPPacket', 'RTCPPacket', 'SilencePacket']
 
+
 def decode(data):
     """Creates an :class:`RTPPacket` or an :class:`RTCPPacket`.
 
@@ -49,11 +50,10 @@ def decode(data):
     # packet are (probably) always 73 (or at least not 200-204).
 
     assert data[0] >> 6 == 2 # check version bits
+    return _rtcp_map.get(data[1], RTPPacket)(data)
 
-    if data[1] in _rtcp_map:
-        return RTCPPacket.from_data(data)
-    else:
-        return RTPPacket(data)
+def is_rtcp(data):
+    return 200 <= data[1] <= 204
 
 def _parse_low(x):
     return x / 2.0 ** x.bit_length()
@@ -153,6 +153,10 @@ class RTCPPacket:
         # dubious, yet devious
         setattr(self, self.__slots__[0], head & 0b00011111)
 
+    def __repr__(self):
+        content = ', '.join("{}: {}".format(k, getattr(self, k, None)) for k in self.__slots__)
+        return "<{} {}>".format(self.__class__.__name__, content)
+
     @classmethod
     def from_data(cls, data):
         _, ptype, _ = cls._header.unpack_from(data)
@@ -166,7 +170,7 @@ class SenderReportPacket(RTCPPacket):
     _report_fmt = struct.Struct('>IB3x4I')
     _24bit_int_fmt = struct.Struct('>4xI')
     _info = namedtuple('RRSenderInfo', 'ntp_ts rtp_ts packet_count octet_count')
-    _report = namedtuple("RRReport", 'ssrc perc_loss total_lost last_seq jitter lsr dlsr')
+    _report = namedtuple("RReport", 'ssrc perc_loss total_lost last_seq jitter lsr dlsr')
     type = 200
 
     def __init__(self, data):
@@ -181,6 +185,7 @@ class SenderReportPacket(RTCPPacket):
 
         self.reports = tuple(reports)
 
+        self.extension = None
         if len(data) > 28 + 24*self.report_count:
             self.extension = data[28 + 24*self.report_count:]
 
@@ -199,7 +204,7 @@ class ReceiverReportPacket(RTCPPacket):
     __slots__ = ('report_count', 'ssrc', 'reports', 'extension')
     _report_fmt = struct.Struct('>IB3x4I')
     _24bit_int_fmt = struct.Struct('>4xI')
-    _report = namedtuple("RRReport", 'ssrc perc_loss total_lost last_seq jitter lsr dlsr')
+    _report = namedtuple("RReport", 'ssrc perc_loss total_lost last_seq jitter lsr dlsr')
     type = 201
 
     def __init__(self, data):
@@ -213,6 +218,7 @@ class ReceiverReportPacket(RTCPPacket):
 
         self.reports = tuple(reports)
 
+        self.extension = None
         if len(data) > 8 + 24*self.report_count:
             self.extension = data[8 + 24*self.report_count:]
 
@@ -221,7 +227,7 @@ class ReceiverReportPacket(RTCPPacket):
         clost = self._24bit_int_fmt.unpack_from(data, offset)[0] & 0xFFFFFF
         return self._report(ssrc, flost, clost, seq, jit, lsr, dlsr)
 
-# UNFORTUNATELY it seems discord only uses the above two packet types.
+# UNFORTUNATELY it seems discord only uses the above ~~two packet types~~ packet type.
 # Good thing I knew that when I made the rest of these. Haha yes.
 
 # http://www.rfcreader.com/#rfc3550_line2024
