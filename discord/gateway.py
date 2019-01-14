@@ -420,7 +420,38 @@ class DiscordWebSocket(websockets.client.WebSocketClientProtocol):
                      self.shard_id, self.session_id, ', '.join(trace))
 
         elif event == 'VOICE_STATE_UPDATE':
-            pass
+            channel_id = data['channel_id']
+            guild_id = int(data['guild_id'])
+
+            # need to handle:
+            # (X) ME changing channel (reset all decoders)
+            # (X) users moving out of MY channel (reset their decoder)
+
+            # TODO: better voice call support
+            vc = self._connection._get_voice_client(guild_id)
+            if vc:
+                user_id = int(data['user_id'])
+
+                # someone moved channels
+                if int(channel_id) != vc.channel.id and vc._reader:
+                    # we moved channels
+                    # do I clean out the old ssrcs?
+                    if self._connection.user.id == user_id:
+                        ...
+                        # print("Resetting all decoders")
+                        # vc._reader._reset_decoder(None)
+
+                    # TODO: figure out how to check if either old/new channel
+                    #       is ours so we don't go around resetting decoders
+                    #       for irrelevant channel moving
+
+                    # someone else moved channels
+                    else:
+                        print(f"ws: Attempting to reset decoder for {user_id}")
+                        ssrc = vc._ssrcs.get(user_id)
+                        # if ssrc is not None:
+                            # print(f"Resetting decoder for ssrc {ssrc}")
+                            # vc._reader._reset_decoder(ssrc)
 
         parser = 'parse_' + event.lower()
 
@@ -758,6 +789,9 @@ class DiscordVoiceWebSocket(websockets.client.WebSocketClientProtocol):
         log.info('received secret key for voice connection')
         self._connection.secret_key = data.get('secret_key')
         await self.speak()
+
+        self._connection.send_audio_packet(b'\xF8\xFF\xFE', encode=False)
+        self._connection.send_audio_packet(b'\xF8\xFF\xFE', encode=False)
         await self.speak(False)
 
     async def poll_event(self):
