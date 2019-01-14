@@ -28,9 +28,16 @@ import array
 import ctypes
 import ctypes.util
 import logging
+import sys
+import time
+import heapq
+import struct
 import os.path
 import sys
 
+from collections import namedtuple, defaultdict
+
+from .rtp import SilencePacket
 from .errors import DiscordException
 
 log = logging.getLogger(__name__)
@@ -132,7 +139,7 @@ try:
         _lib = libopus_loader(_filename)
     else:
         _lib = libopus_loader(ctypes.util.find_library('opus'))
-except Exception:
+except Exception as e:
     _lib = None
     log.warning("Unable to load opus lib, %s", e)
 
@@ -361,3 +368,116 @@ class Decoder:
             raise
 
         return array.array('h', pcm).tobytes()
+
+class OpusRouter:
+    """
+        timestamp delta should be decoder.SAMPLES_PER_FRAME
+
+        seq delta should be 1 for normal packets,
+        5 between client added silence from speaking state change
+        * I think, something about that doesn't exactly make sense *
+    """
+
+    def __init__(self, output_func, *, buffer=200):
+        self.output_func = output_func
+        self.buffer_size = buffer // 20
+        self.rtpheap = []
+
+        # This is how long the router waits to pump silence (in 20ms chunks)
+        # higher values will wait longer and pump in larger chunks
+        self.silence_threshold = 10
+
+        self.last_packet_seq = 0
+        self.last_packet_recv = 0
+        self.last_decode_seq = 0
+
+        self._decoder = Decoder()
+        self.ssrc = None
+
+    def feed(self, packet):
+        self.ssrc = packet.ssrc # dumb hack
+
+        if not self.rtpheap or packet.sequence > self.rtpheap[0].sequence:
+            self.last_packet_seq = packet.sequence
+            self.last_packet_recv = time.time()
+
+            heapq.heappush(self.rtpheap, packet)
+        else:
+            print("Rejected packet %s < %s" % (
+                packet.sequence, self.rtpheap[0].sequence))
+
+    def flush_packets(self):
+        self._flush(len(self.rtpheap))
+
+    def flush_half(self):
+        self._flush(self.buffer_size//2)
+
+    def _flush(self, count):
+        for x in range(min(len(self.rtpheap), count)):
+            packet = heapq.heappop(self.rtpheap)
+            self._add_silence(packet)
+            self.decode(packet)
+
+    def _add_silence(self, packet):
+        gap = packet.sequence - self.last_decode_seq
+        if gap >= 5 and self.last_decode_seq:
+            # print(f"Adding in {gap} silence frames before decode")
+            for x in range(gap):
+                self.decode(None)
+
+    def decode(self, packet):
+        opus = None
+        if packet:
+            opus = packet.decrypted_data
+            self.last_decode_seq = packet.sequence
+            # print("Decoding packet %s" % packet.sequence)
+        else:
+            packet = SilencePacket(self.ssrc)
+            # TODO: Test incrementing seq in filler silence packets
+
+        pcm = self._decoder.decode(opus)
+        opus = opus or b'\xF8\xFF\xFE'
+        self.output_func(pcm, opus, packet)
+
+    def reset(self, *, flush=True):
+        # TODO optimization: check if the decoder /needs/ to be reset
+        if flush:
+            self.flush_packets()
+
+        for x in range(10):
+            self._decoder.decode(None)
+
+        self.last_packet_seq = 0
+        self.last_packet_recv = 0
+        self.last_decode_seq = 0
+
+    def notify(self):
+        if not self.last_packet_recv:
+            # print("Warning: no packet received yet")
+            return
+
+        self.flush_half()
+
+        # - 1 so there's leftover time to reduce rounding related issues
+        gap = time.time() - self.last_packet_recv - 1
+        missing = int(round(gap / 0.02, 0))
+
+        if missing <= self.silence_threshold:
+            return
+        elif missing > 10000:
+            print(f"Missing a LOT of frames for {self.ssrc}: {missing} (last: {self.last_packet_recv})")
+            # something weird can happen where you get a fuckton of
+            # missing frames from the calculation, not sure exactly
+            # how to handle this yet
+            return
+
+        # print("Missing %s, flushing %s" % (missing, len(self.rtpheap)))
+        self.flush_packets()
+
+        for x in range(missing):
+            self.decode(None)
+
+        # Inflate stats to account for silence
+        self.last_packet_seq += missing
+        self.last_packet_recv += gap
+        self.last_decode_seq += missing
