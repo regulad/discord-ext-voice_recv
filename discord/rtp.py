@@ -34,6 +34,7 @@ log = logging.getLogger(__name__)
 
 __all__ = ['decode', 'RTPPacket', 'RTCPPacket', 'SilencePacket']
 
+
 def decode(data):
     """Creates an :class:`RTPPacket` or an :class:`RTCPPacket`.
 
@@ -49,11 +50,10 @@ def decode(data):
     # packet are (probably) always 73 (or at least not 200-204).
 
     assert data[0] >> 6 == 2 # check version bits
+    return _rtcp_map.get(data[1], RTPPacket)(data)
 
-    if data[1] in _rtcp_map:
-        return RTCPPacket.from_data(data)
-    else:
-        return RTPPacket(data)
+def is_rtcp(data):
+    return 200 <= data[1] <= 204
 
 def _parse_low(x):
     return x / 2.0 ** x.bit_length()
@@ -152,6 +152,10 @@ class RTCPPacket:
         self.padding = bool(head & 0b00100000)
         # dubious, yet devious
         setattr(self, self.__slots__[0], head & 0b00011111)
+
+    def __repr__(self):
+        content = ', '.join("{}: {}".format(k, getattr(self, k, None)) for k in self.__slots__)
+        return "<{} {}>".format(self.__class__.__name__, content)
 
     @classmethod
     def from_data(cls, data):
