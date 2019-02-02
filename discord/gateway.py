@@ -433,7 +433,7 @@ class DiscordWebSocket(websockets.client.WebSocketClientProtocol):
                 user_id = int(data['user_id'])
 
                 # someone moved channels
-                if int(channel_id) != vc.channel.id and vc._reader:
+                if channel_id and int(channel_id) != vc.channel.id and vc._reader:
                     # we moved channels
                     # do I clean out the old ssrcs?
                     if self._connection.user.id == user_id:
@@ -738,6 +738,7 @@ class DiscordVoiceWebSocket(websockets.client.WebSocketClientProtocol):
         elif op == self.SESSION_DESCRIPTION:
             self._connection.mode = data['mode']
             await self.load_secret_key(data)
+            await self._do_hacks()
         elif op == self.HELLO:
             interval = data['heartbeat_interval'] / 1000.0
             self._keep_alive = VoiceKeepAliveHandler(ws=self, interval=interval)
@@ -745,11 +746,15 @@ class DiscordVoiceWebSocket(websockets.client.WebSocketClientProtocol):
         elif op == self.SPEAKING:
             user_id = int(data['user_id'])
             vc = self._connection
+            vc._ssrcs[data['ssrc']] = user_id
+
             if vc.guild:
                 user = vc.guild.get_member(user_id)
             else:
                 user = vc._state.get_user(user_id)
-            self._dispatch('voice_speaking_update', user, data['speaking'])
+
+            vc._state.dispatch('voice_speaking_update', user, data['speaking'])
+
         elif op == self.CLIENT_CONNECT:
             self._connection._ssrcs[int(data['user_id'])] = data['audio_ssrc']
         elif op == self.CLIENT_DISCONNECT:
@@ -760,6 +765,7 @@ class DiscordVoiceWebSocket(websockets.client.WebSocketClientProtocol):
         state.ssrc = data['ssrc']
         state.voice_port = data['port']
         state.endpoint_ip = data['ip']
+        # todo: see if you recv your own packets if you have your own ssrc cached
 
         packet = bytearray(70)
         struct.pack_into('>I', packet, 0, state.ssrc)
@@ -788,10 +794,24 @@ class DiscordVoiceWebSocket(websockets.client.WebSocketClientProtocol):
     async def load_secret_key(self, data):
         log.info('received secret key for voice connection')
         self._connection.secret_key = data.get('secret_key')
+
+    async def _do_hacks(self):
+        # Everything below this is a hack because discord keeps breaking things
+
+        # hack #1
+        # speaking needs to be set otherwise reconnecting makes you forget that the
+        # bot is playing audio and you wont hear it until the bot sets speaking again
         await self.speak()
 
+        # hack #3:
+        # you need to wait for some indeterminate amount of time before sending silence
+        await asyncio.sleep(0.5)
+
+        # hack #2:
+        # sending a silence packet is required to be able to read from the socket
         self._connection.send_audio_packet(b'\xF8\xFF\xFE', encode=False)
-        self._connection.send_audio_packet(b'\xF8\xFF\xFE', encode=False)
+
+        # just so we don't have the speaking circle when we're not actually speaking
         await self.speak(False)
 
     async def poll_event(self):

@@ -130,7 +130,9 @@ class AudioReader(threading.Thread):
         self._sink = sink
         self.client = client
 
-        self.box = nacl.secret.SecretBox(bytes(self.client.secret_key))
+        self.box = nacl.secret.SecretBox(bytes(client.secret_key))
+        self._decrypt_rtp = getattr(self, '_decrypt_rtp_' + client.mode)
+        self._decrypt_rtcp = getattr(self, '_decrypt_rtcp_' + client.mode)
 
         self._connected = client._connected
         self._current_error = None
@@ -147,23 +149,41 @@ class AudioReader(threading.Thread):
         if wait:
             self.join()
 
-    def _decrypt_voice_packet(self, packet):
+    def _decrypt_rtp_xsalsa20_poly1305(self, packet):
         nonce = bytearray(24)
         nonce[:12] = packet.header
-        data = self.box.decrypt(bytes(packet.data), bytes(nonce))
+        result = self.box.decrypt(bytes(packet.data), bytes(nonce))
 
         if packet.extended:
-            offset = packet.update_ext_headers(data)
-            data = data[offset:]
+            offset = packet.update_ext_headers(result)
+            result = result[offset:]
 
-        return data
+        return result
 
-    def _decrypt_voice_control_packet(self, packet):
+    def _decrypt_rtcp_xsalsa20_poly1305(self, data):
         nonce = bytearray(24)
-        nonce[:8] = packet[:8]
-        data = self.box.decrypt(bytes(packet[8:]), bytes(nonce))
+        nonce[:8] = data[:8]
+        result = self.box.decrypt(data[8:], bytes(nonce))
 
-        return packet[:8] + data
+        return data[:8] + result
+
+    def _decrypt_rtp_xsalsa20_poly1305_suffix(self, packet):
+        nonce = packet.data[-24:]
+        voice_data = packet.data[:-24]
+        result = self.box.decrypt(bytes(voice_data), bytes(nonce))
+
+        if packet.extended:
+            offset = packet.update_ext_headers(result)
+            result = result[offset:]
+
+        return result
+
+    def _decrypt_rtcp_xsalsa20_poly1305_suffix(self, data):
+        nonce = data[-24:]
+        header = data[:8]
+        result = self.box.decrypt(data[8:-24], nonce)
+
+        return header + result
 
     def _reset_decoder(self, ssrc):
         with self._decoder_lock:
@@ -254,18 +274,18 @@ class AudioReader(threading.Thread):
                     raise
 
             try:
+                packet = None
+
                 if not rtp.is_rtcp(raw_data):
                     packet = rtp.decode(raw_data)
-                    opus_data = self._decrypt_voice_packet(packet)
-                    packet.decrypted_data = opus_data
+                    packet.decrypted_data = self._decrypt_rtp(packet)
                 else:
-                    packet = rtp.decode(self._decrypt_voice_control_packet(raw_data))
+                    packet = rtp.decode(self._decrypt_rtcp(raw_data))
                     if not isinstance(packet, rtp.ReceiverReportPacket):
                         print(packet)
                     continue # oh right I don't have any way to send these yet
 
             except CryptoError:
-                # should no longer happen (in theory)
                 log.exception("CryptoError decoding packet %s", packet)
                 continue
 
