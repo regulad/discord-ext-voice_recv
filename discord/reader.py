@@ -156,7 +156,7 @@ class AudioReader(threading.Thread):
         self._sink = sink
         self.client = client
 
-        self.box = nacl.secret.SecretBox(bytes(client.secret_key))
+        self._box = nacl.secret.SecretBox(bytes(client.secret_key))
         self._decrypt_rtp = getattr(self, '_decrypt_rtp_' + client.mode)
         self._decrypt_rtcp = getattr(self, '_decrypt_rtcp_' + client.mode)
 
@@ -178,7 +178,7 @@ class AudioReader(threading.Thread):
     def _decrypt_rtp_xsalsa20_poly1305(self, packet):
         nonce = bytearray(24)
         nonce[:12] = packet.header
-        result = self.box.decrypt(bytes(packet.data), bytes(nonce))
+        result = self._box.decrypt(bytes(packet.data), bytes(nonce))
 
         if packet.extended:
             offset = packet.update_ext_headers(result)
@@ -189,14 +189,14 @@ class AudioReader(threading.Thread):
     def _decrypt_rtcp_xsalsa20_poly1305(self, data):
         nonce = bytearray(24)
         nonce[:8] = data[:8]
-        result = self.box.decrypt(data[8:], bytes(nonce))
+        result = self._box.decrypt(data[8:], bytes(nonce))
 
         return data[:8] + result
 
     def _decrypt_rtp_xsalsa20_poly1305_suffix(self, packet):
         nonce = packet.data[-24:]
         voice_data = packet.data[:-24]
-        result = self.box.decrypt(bytes(voice_data), bytes(nonce))
+        result = self._box.decrypt(bytes(voice_data), bytes(nonce))
 
         if packet.extended:
             offset = packet.update_ext_headers(result)
@@ -207,7 +207,27 @@ class AudioReader(threading.Thread):
     def _decrypt_rtcp_xsalsa20_poly1305_suffix(self, data):
         nonce = data[-24:]
         header = data[:8]
-        result = self.box.decrypt(data[8:-24], nonce)
+        result = self._box.decrypt(data[8:-24], nonce)
+
+        return header + result
+
+    def _decrypt_rtp_xsalsa20_poly1305_lite(self, packet):
+        nonce = bytearray(24)
+        nonce[:4] = packet.data[-4:]
+        voice_data = packet.data[:-4]
+        result = self._box.decrypt(bytes(voice_data), bytes(nonce))
+
+        if packet.extended:
+            offset = packet.update_ext_headers(result)
+            result = result[offset:]
+
+        return result
+
+    def _decrypt_rtcp_xsalsa20_poly1305_lite(self, data):
+        nonce = bytearray(24)
+        nonce[:4] = data[-4:]
+        header = data[:8]
+        result = self._box.decrypt(data[8:-4], bytes(nonce))
 
         return header + result
 

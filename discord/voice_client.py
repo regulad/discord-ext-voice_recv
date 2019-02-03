@@ -112,6 +112,7 @@ class VoiceClient:
         self._connections = 0
         self.sequence = 0
         self.timestamp = 0
+        self._nonce = 0
         self._runner = None
         self._player = None
         self._reader = None
@@ -120,6 +121,7 @@ class VoiceClient:
 
     warn_nacl = not has_nacl
     supported_modes = (
+        'xsalsa20_poly1305_lite',
         'xsalsa20_poly1305_suffix',
         'xsalsa20_poly1305',
     )
@@ -336,6 +338,14 @@ class VoiceClient:
         nonce = nacl.utils.random(nacl.secret.SecretBox.NONCE_SIZE)
 
         return header + box.encrypt(bytes(data), nonce).ciphertext + nonce
+
+    def _encrypt_xsalsa20_poly1305_lite(self, header, data):
+        box = nacl.secret.SecretBox(bytes(self.secret_key))
+        nonce = bytearray(24)
+        self.checked_add('_nonce', 1, 4294967295)
+        nonce[:4] = self._nonce.to_bytes(4, 'big')
+
+        return header + box.encrypt(bytes(data), bytes(nonce)).ciphertext + nonce[:4]
 
     def play(self, source, *, after=None):
         """Plays an :class:`AudioSource`.
