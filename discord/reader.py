@@ -157,8 +157,8 @@ class AudioReader(threading.Thread):
         self.client = client
 
         self._box = nacl.secret.SecretBox(bytes(client.secret_key))
-        self._decrypt_rtp = getattr(self, '_decrypt_rtp_' + client.mode)
-        self._decrypt_rtcp = getattr(self, '_decrypt_rtcp_' + client.mode)
+        self._decrypt_rtp = getattr(self, '_decrypt_rtp_' + client._mode)
+        self._decrypt_rtcp = getattr(self, '_decrypt_rtcp_' + client._mode)
 
         self._connected = client._connected
         self._current_error = None

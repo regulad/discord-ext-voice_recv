@@ -108,7 +108,7 @@ class VoiceClient:
         # this will be used in the AudioReader thread
         self._connecting = threading.Condition()
 
-        self.mode = None
+        self._mode = None
         self._connections = 0
         self.sequence = 0
         self.timestamp = 0
@@ -323,7 +323,7 @@ class VoiceClient:
         struct.pack_into('>I', header, 4, self.timestamp)
         struct.pack_into('>I', header, 8, self.ssrc)
 
-        encrypt_packet = getattr(self, '_encrypt_' + self.mode)
+        encrypt_packet = getattr(self, '_encrypt_' + self._mode)
         return encrypt_packet(header, data)
 
     def _encrypt_xsalsa20_poly1305(self, header, data):
