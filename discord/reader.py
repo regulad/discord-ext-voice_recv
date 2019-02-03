@@ -305,7 +305,10 @@ class AudioReader(threading.Thread):
                 raw_data = self.client.socket.recv(4096)
             except socket.error as e:
                 t0 = time.time()
-                # TODO: Catch and ignore "not a socket" error
+
+                if e.errno == 10038:
+                    continue
+
                 print(f"Socket error in reader thread: {e} {t0}")
 
                 with self.client._connecting:
@@ -336,8 +339,7 @@ class AudioReader(threading.Thread):
                 continue
 
             except:
-                # Dropped/invalid (idk if packets can be non-rtp)
-                log.exception("Unknown error decoding packet")
+                log.exception("Error decoding packet")
                 traceback.print_exc()
 
             else:
