@@ -41,7 +41,8 @@ from .rtp import SilencePacket
 from .errors import DiscordException
 
 log = logging.getLogger(__name__)
-c_int_ptr = ctypes.POINTER(ctypes.c_int)
+
+c_int_ptr   = ctypes.POINTER(ctypes.c_int)
 c_int16_ptr = ctypes.POINTER(ctypes.c_int16)
 c_float_ptr = ctypes.POINTER(ctypes.c_float)
 
@@ -54,7 +55,7 @@ class DecoderStruct(ctypes.Structure):
     pass
 
 EncoderStructPtr = ctypes.POINTER(EncoderStruct)
-DecoderStructPtr = ctypes.POINTER(EncoderStruct)
+DecoderStructPtr = ctypes.POINTER(DecoderStruct)
 
 def _err_lt(result, func, args):
     if result < 0:
@@ -77,6 +78,15 @@ def _err_ne(result, func, args):
 exported_functions = [
     ('opus_strerror',
         [ctypes.c_int], ctypes.c_char_p, None),
+    ('opus_packet_get_bandwidth',
+        [ctypes.c_char_p], ctypes.c_int, _err_lt),
+    ('opus_packet_get_nb_channels',
+        [ctypes.c_char_p], ctypes.c_int, _err_lt),
+    ('opus_packet_get_nb_frames',
+        [ctypes.c_char_p, ctypes.c_int], ctypes.c_int, _err_lt),
+    ('opus_packet_get_samples_per_frame',
+        [ctypes.c_char_p, ctypes.c_int], ctypes.c_int, _err_lt),
+
     ('opus_encoder_get_size',
         [ctypes.c_int], ctypes.c_int, None),
     ('opus_encoder_create',
@@ -92,14 +102,6 @@ exported_functions = [
         [ctypes.c_int], ctypes.c_int, None),
     ('opus_decoder_create',
         [ctypes.c_int, ctypes.c_int, c_int_ptr], DecoderStructPtr, _err_ne),
-    ('opus_packet_get_bandwidth',
-        [ctypes.c_char_p], ctypes.c_int, _err_lt),
-    ('opus_packet_get_nb_channels',
-        [ctypes.c_char_p], ctypes.c_int, _err_lt),
-    ('opus_packet_get_nb_frames',
-        [ctypes.c_char_p, ctypes.c_int], ctypes.c_int, _err_lt),
-    ('opus_packet_get_samples_per_frame',
-        [ctypes.c_char_p, ctypes.c_int], ctypes.c_int, _err_lt),
     ('opus_decoder_get_nb_samples',
         [DecoderStructPtr, ctypes.c_char_p, ctypes.c_int32], ctypes.c_int, _err_lt),
     ('opus_decode',
@@ -246,22 +248,23 @@ signal_ctl = {
     'music': 3002,
 }
 
-class Encoder:
+class _OpusStruct:
     SAMPLING_RATE = 48000
     CHANNELS = 2
-    FRAME_LENGTH = 20
+    FRAME_LENGTH = 20 # in ms
     SAMPLE_SIZE = 4 # (bit_rate / 8) * CHANNELS (bit_rate == 16)
     SAMPLES_PER_FRAME = int(SAMPLING_RATE / 1000 * FRAME_LENGTH)
 
     FRAME_SIZE = SAMPLES_PER_FRAME * SAMPLE_SIZE
 
-    def __init__(self, application=APPLICATION_AUDIO):
-        self.application = application
 
+class Encoder(_OpusStruct):
+    def __init__(self, application=APPLICATION_AUDIO):
         if not is_loaded():
             if not _load_default():
                 raise OpusNotLoaded()
 
+        self.application = application
         self._state = self._create_state()
         self.set_bitrate(128)
         self.set_fec(True)
@@ -313,21 +316,12 @@ class Encoder:
 
         return array.array('b', data[:ret]).tobytes()
 
-class Decoder:
-    SAMPLING_RATE = 48000
-    CHANNELS = 2
-    FRAME_LENGTH = 20
-    SAMPLE_SIZE = 4
-    SAMPLES_PER_FRAME = int(SAMPLING_RATE / 1000 * FRAME_LENGTH)
-
-    FRAME_SIZE = SAMPLES_PER_FRAME * SAMPLE_SIZE
-
+class Decoder(_OpusStruct):
     def __init__(self, application=APPLICATION_VOIP):
-        self.application = application
-
         if not is_loaded():
             raise OpusNotLoaded()
 
+        self.application = application
         self._state = self._create_state()
 
     def __del__(self):
@@ -339,43 +333,39 @@ class Decoder:
         ret = ctypes.c_int()
         return _lib.opus_decoder_create(self.SAMPLING_RATE, self.CHANNELS, ctypes.byref(ret))
 
-    @classmethod
-    def _packet_get_nb_frames(cls, data):
+    @staticmethod
+    def packet_get_nb_frames(data):
         """Gets the number of frames in an Opus packet"""
         return _lib.opus_packet_get_nb_frames(data, len(data))
 
-    @classmethod
-    def _packet_get_nb_channels(cls, data):
+    @staticmethod
+    def packet_get_nb_channels(data):
         """Gets the number of channels in an Opus packet"""
         return _lib.opus_packet_get_nb_channels(data)
 
-    def _packet_get_samples_per_frame(self, data):
+    @classmethod
+    def packet_get_samples_per_frame(cls, data):
         """Gets the number of samples per frame from an Opus packet"""
-        return _lib.opus_packet_get_samples_per_frame(data, self.SAMPLING_RATE)
+        return _lib.opus_packet_get_samples_per_frame(data, cls.SAMPLING_RATE)
 
-    def decode(self, data, decode_fec=False):
+    def decode(self, data, *, fec=False):
+        if data is None and fec:
+            raise OpusError("Invalid arguments: FEC cannot be used with null data")
+
         if data is None:
-            frame_size = 960 # somewhat of a hack, will fix later
-            dlen = 0
+            # You're supposed to use the data from the previous frame but w/e
+            frame_size = self.SAMPLES_PER_FRAME
         else:
-            dlen = len(data)
-            frames = self._packet_get_nb_frames(data)
-            samples_per_frame = self._packet_get_samples_per_frame(data)
-
-            channels = self._packet_get_nb_channels(data)
+            frames = self.packet_get_nb_frames(data)
+            samples_per_frame = self.packet_get_samples_per_frame(data)
+            # channels = self.packet_get_nb_channels(data)
             frame_size = frames * samples_per_frame
 
         pcm_size = frame_size * self.CHANNELS
         pcm = (ctypes.c_int16 * pcm_size)()
         pcm_ptr = ctypes.cast(pcm, ctypes.POINTER(ctypes.c_int16))
 
-        # try block is only temp
-        try:
-            result = _lib.opus_decode(self._state, data, dlen, pcm_ptr, frame_size, decode_fec)
-        except:
-            print("decode error %s (%s)" % (result, len(pcm)))
-            raise
-
+        result = _lib.opus_decode(self._state, data, len(data) if data else 0, pcm_ptr, frame_size, fec)
         return array.array('h', pcm).tobytes()
 
 class OpusRouter:
