@@ -58,7 +58,20 @@ def is_rtcp(data):
 def _parse_low(x):
     return x / 2.0 ** x.bit_length()
 
-class SilencePacket:
+
+class _SeqCmpMixin:
+    __slots__ = ()
+
+    def __lt__(self, other):
+        return self.sequence < other.sequence
+
+    def __gt__(self, other):
+        return self.sequence > other.sequence
+
+    def __eq__(self, other):
+        return self.sequence == other.sequence
+
+class SilencePacket(_SeqCmpMixin):
     __slots__ = ('ssrc', 'sequence')
     decrypted_data = b'\xF8\xFF\xFE'
 
@@ -68,7 +81,7 @@ class SilencePacket:
 
 # Consider adding silence attribute to differentiate (to skip isinstance)
 
-class RTPPacket:
+class RTPPacket(_SeqCmpMixin):
     __slots__ = ('version', 'padding', 'extended', 'cc', 'marker',
                  'payload', 'sequence', 'timestamp', 'ssrc', 'csrcs',
                  'header', 'data', 'decrypted_data', 'extension')
@@ -129,18 +142,8 @@ class RTPPacket:
                'ssrc={0.ssrc}, size={1}' \
                '>'.format(self, len(self.data))
 
-    def __lt__(self, other):
-        return self.sequence < other.sequence
-
-    def __gt__(self, other):
-        return self.sequence > other.sequence
-
-    def __eq__(self, other):
-        return self.sequence == other.sequence
-
-
 # http://www.rfcreader.com/#rfc3550_line855
-class RTCPPacket:
+class RTCPPacket(_SeqCmpMixin):
     __slots__ = ('version', 'padding', 'length')
     _header = struct.Struct('>BBH')
     _ssrc_fmt = struct.Struct('>I')
