@@ -59,29 +59,44 @@ def _parse_low(x):
     return x / 2.0 ** x.bit_length()
 
 
-class _SeqCmpMixin:
+class _PacketCmpMixin:
     __slots__ = ()
 
     def __lt__(self, other):
-        return self.sequence < other.sequence
+        return self.timestamp < other.timestamp
 
     def __gt__(self, other):
-        return self.sequence > other.sequence
+        return self.timestamp > other.timestamp
 
     def __eq__(self, other):
-        return self.sequence == other.sequence
+        return self.timestamp == other.timestamp
 
-class SilencePacket(_SeqCmpMixin):
-    __slots__ = ('ssrc', 'sequence')
+class SilencePacket(_PacketCmpMixin):
+    __slots__ = ('ssrc', 'timestamp')
     decrypted_data = b'\xF8\xFF\xFE'
 
-    def __init__(self, ssrc, sequence=0):
+    def __init__(self, ssrc, timestamp):
         self.ssrc = ssrc
-        self.sequence = sequence
+        self.timestamp = timestamp
+
+    def __repr__(self):
+        return '<SilencePacket timestamp={0.timestamp}, ssrc={0.ssrc}>'.format(self)
+
+class FECPacket(_PacketCmpMixin):
+    __slots__ = ('ssrc', 'timestamp', 'sequence')
+    decrypted_data = b''
+
+    def __init__(self, ssrc, timestamp, sequence):
+        self.ssrc = ssrc
+        self.timestamp = sequence
+        self.sequence = timestamp
+
+    def __repr__(self):
+        return '<FECPacket timestamp={0.timestamp}, sequence={0.sequence}, ssrc={0.ssrc}>'.format(self)
 
 # Consider adding silence attribute to differentiate (to skip isinstance)
 
-class RTPPacket(_SeqCmpMixin):
+class RTPPacket(_PacketCmpMixin):
     __slots__ = ('version', 'padding', 'extended', 'cc', 'marker',
                  'payload', 'sequence', 'timestamp', 'ssrc', 'csrcs',
                  'header', 'data', 'decrypted_data', 'extension')
@@ -143,7 +158,7 @@ class RTPPacket(_SeqCmpMixin):
                '>'.format(self, len(self.data))
 
 # http://www.rfcreader.com/#rfc3550_line855
-class RTCPPacket(_SeqCmpMixin):
+class RTCPPacket(_PacketCmpMixin):
     __slots__ = ('version', 'padding', 'length')
     _header = struct.Struct('>BBH')
     _ssrc_fmt = struct.Struct('>I')
