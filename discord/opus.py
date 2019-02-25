@@ -30,15 +30,19 @@ import ctypes.util
 import logging
 import sys
 import time
-import heapq
 import struct
 import os.path
 import sys
+import bisect
+import threading
+import traceback
 
-from collections import namedtuple, defaultdict
+from math import log10
 
-from .rtp import SilencePacket
+from . import utils
+from .rtp import RTPPacket, RTCPPacket, SilencePacket, FECPacket
 from .errors import DiscordException
+
 
 log = logging.getLogger(__name__)
 
@@ -57,15 +61,49 @@ class DecoderStruct(ctypes.Structure):
 EncoderStructPtr = ctypes.POINTER(EncoderStruct)
 DecoderStructPtr = ctypes.POINTER(DecoderStruct)
 
+## Some constants from opus_defines.h
+# Error codes
+OK      = 0
+BAD_ARG = -1
+
+# Encoder CTLs
+APPLICATION_AUDIO    = 2049
+APPLICATION_VOIP     = 2048
+APPLICATION_LOWDELAY = 2051
+
+CTL_SET_BITRATE      = 4002
+CTL_SET_BANDWIDTH    = 4008
+CTL_SET_FEC          = 4012
+CTL_SET_PLP          = 4014
+CTL_SET_SIGNAL       = 4024
+
+# Decoder CTLs
+CTL_SET_GAIN             = 4034
+CTL_LAST_PACKET_DURATION = 4039
+
+band_ctl = {
+    'narrow': 1101,
+    'medium': 1102,
+    'wide': 1103,
+    'superwide': 1104,
+    'full': 1105,
+}
+
+signal_ctl = {
+    'auto': -1000,
+    'voice': 3001,
+    'music': 3002,
+}
+
 def _err_lt(result, func, args):
-    if result < 0:
+    if result < OK:
         log.info('error has happened in %s', func.__name__)
         raise OpusError(result)
     return result
 
 def _err_ne(result, func, args):
     ret = args[-1]._obj
-    if ret.value != 0:
+    if ret.value != OK:
         log.info('error has happened in %s', func.__name__)
         raise OpusError(ret.value)
     return result
@@ -107,6 +145,8 @@ exported_functions = [
     ('opus_decode',
         [DecoderStructPtr, ctypes.c_char_p, ctypes.c_int32, c_int16_ptr, ctypes.c_int, ctypes.c_int],
         ctypes.c_int, _err_lt),
+    ('opus_decoder_ctl',
+        None, ctypes.c_int32, _err_lt),
     ('opus_decoder_destroy',
         [DecoderStructPtr], None, None)
 ]
@@ -222,32 +262,6 @@ class OpusNotLoaded(DiscordException):
     """An exception that is thrown for when libopus is not loaded."""
     pass
 
-
-# Some constants...
-OK = 0
-APPLICATION_AUDIO    = 2049
-APPLICATION_VOIP     = 2048
-APPLICATION_LOWDELAY = 2051
-CTL_SET_BITRATE      = 4002
-CTL_SET_BANDWIDTH    = 4008
-CTL_SET_FEC          = 4012
-CTL_SET_PLP          = 4014
-CTL_SET_SIGNAL       = 4024
-
-band_ctl = {
-    'narrow': 1101,
-    'medium': 1102,
-    'wide': 1103,
-    'superwide': 1104,
-    'full': 1105,
-}
-
-signal_ctl = {
-    'auto': -1000,
-    'voice': 3001,
-    'music': 3002,
-}
-
 class _OpusStruct:
     SAMPLING_RATE = 48000
     CHANNELS = 2
@@ -256,7 +270,6 @@ class _OpusStruct:
     SAMPLES_PER_FRAME = int(SAMPLING_RATE / 1000 * FRAME_LENGTH)
 
     FRAME_SIZE = SAMPLES_PER_FRAME * SAMPLE_SIZE
-
 
 class Encoder(_OpusStruct):
     def __init__(self, application=APPLICATION_AUDIO):
@@ -317,11 +330,11 @@ class Encoder(_OpusStruct):
         return array.array('b', data[:ret]).tobytes()
 
 class Decoder(_OpusStruct):
-    def __init__(self, application=APPLICATION_VOIP):
+    def __init__(self):
         if not is_loaded():
             raise OpusNotLoaded()
 
-        self.application = application
+
         self._state = self._create_state()
 
     def __del__(self):
@@ -348,135 +361,372 @@ class Decoder(_OpusStruct):
         """Gets the number of samples per frame from an Opus packet"""
         return _lib.opus_packet_get_samples_per_frame(data, cls.SAMPLING_RATE)
 
+    def set_gain(self, adjustment):
+        """Configures decoder gain adjustment.
+        Scales the decoded output by a factor specified in Q8 dB units.
+        This has a maximum range of -32768 to 32767 inclusive, and returns
+        OPUS_BAD_ARG (-1) otherwise. The default is zero indicating no adjustment.
+        This setting survives decoder reset (irrelevant).
+
+        gain = pow(10, x/(20.0*256))
+
+        (from opus_defines.h)
+        """
+        return _lib.opus_decoder_ctl(self._state, CTL_SET_GAIN, adjustment)
+
+    def set_volume(self, volume):
+        """Sets the output volume as a float percent.  The input value is different than set_gain.
+        The math is a little bit janky but I think it probably works well enough for now.
+        """
+
+        if volume == 1:
+            return self.set_gain(0)
+        elif volume < 1:
+            volume = 1/volume
+            dB = -(5120*log10(10*log10(volume)))
+        else:
+            dB = 5120*log10(10*log10(volume))
+
+        return self.set_gain(dB)
+
+    def _get_last_packet_duration(self):
+        """Gets the duration (in samples) of the last packet successfully decoded or concealed."""
+
+        ret = ctypes.c_int32()
+        _lib.opus_decoder_ctl(self._state, CTL_LAST_PACKET_DURATION, ctypes.byref(ret))
+        return ret.value
+
     def decode(self, data, *, fec=False):
         if data is None and fec:
             raise OpusError("Invalid arguments: FEC cannot be used with null data")
 
         if data is None:
-            # You're supposed to use the data from the previous frame but w/e
-            frame_size = self.SAMPLES_PER_FRAME
+            frame_size = self._get_last_packet_duration() or self.SAMPLES_PER_FRAME
         else:
             frames = self.packet_get_nb_frames(data)
             samples_per_frame = self.packet_get_samples_per_frame(data)
-            # channels = self.packet_get_nb_channels(data)
             frame_size = frames * samples_per_frame
 
-        pcm_size = frame_size * self.CHANNELS
-        pcm = (ctypes.c_int16 * pcm_size)()
+        pcm = (ctypes.c_int16 * (frame_size * self.CHANNELS))()
         pcm_ptr = ctypes.cast(pcm, ctypes.POINTER(ctypes.c_int16))
 
         result = _lib.opus_decode(self._state, data, len(data) if data else 0, pcm_ptr, frame_size, fec)
         return array.array('h', pcm).tobytes()
 
-class OpusRouter:
-    """
-        timestamp delta should be decoder.SAMPLES_PER_FRAME
+# class OpusRouter:
+#     """
+#         timestamp delta should be decoder.SAMPLES_PER_FRAME
 
-        seq delta should be 1 for normal packets,
-        5 between client added silence from speaking state change
-        * I think, something about that doesn't exactly make sense *
-    """
+#         seq delta should be 1 for normal packets,
+#         5 between client added silence from speaking state change
+#         * I think, something about that doesn't exactly make sense *
+#     """
+
+#     def __init__(self, output_func, *, buffer=200):
+#         self.output_func = output_func
+#         self.buffer_size = buffer // 20
+#         self.rtpheap = []
+
+#         # This is how many packets the router waits to pump silence (in 20ms chunks)
+#         # higher values will wait longer and pump in larger chunks
+#         self.silence_threshold = 10
+
+#         self.last_packet_seq = 0
+#         self.last_packet_recv = 0
+#         self.last_decode_seq = 0
+#         self.last_packet_was_silence = False
+
+#         self._decoder = Decoder()
+#         self.ssrc = None
+
+#     def feed(self, packet):
+#         self.ssrc = packet.ssrc # dumb hack
+
+#         if not self.rtpheap or packet.sequence > self.rtpheap[0].sequence:
+#             self.last_packet_seq = packet.sequence
+#             self.last_packet_recv = time.time()
+
+#             heapq.heappush(self.rtpheap, packet)
+#         else:
+#             print("Rejected packet %s < %s" % (
+#                 packet.sequence, self.rtpheap[0].sequence))
+
+#     def flush_packets(self):
+#         self._flush(len(self.rtpheap))
+
+#     def flush_half(self):
+#         self._flush(self.buffer_size//2)
+
+#     def _flush(self, count):
+#         for x in range(min(len(self.rtpheap), count)):
+#             packet = heapq.heappop(self.rtpheap)
+#             self._add_silence(packet)
+#             self.decode(packet)
+
+#     def _add_silence(self, packet):
+#         gap = packet.sequence - self.last_decode_seq
+#         if gap >= 5 and self.last_decode_seq:
+#             # print(f"Adding in {gap} silence frames before decode")
+#             for x in range(gap):
+#                 self.decode(None)
+
+#     def decode(self, packet):
+#         opus = None
+#         if packet:
+#             # print("Decoding packet %s" % packet.sequence)
+#             opus = packet.decrypted_data
+#             if self.last_packet_was_silence:
+#                 ...
+#         else:
+#             packet = SilencePacket(self.ssrc, self.last_decode_seq)
+#             self.last_packet_was_silence = True
+#             # TODO: Test incrementing seq in filler silence packets
+
+#         pcm = self._decoder.decode(opus)
+#         self.last_decode_seq += 1
+
+#         opus = packet.decrypted_data
+#         self.output_func(pcm, opus, packet)
+
+#     def reset(self, *, flush=True):
+#         # TODO optimization: check if the decoder /needs/ to be reset
+#         if flush:
+#             self.flush_packets()
+
+#         self.rtpheap.clear()
+
+#         for x in range(10):
+#             self._decoder.decode(None)
+
+#         self.last_packet_seq = 0
+#         self.last_packet_recv = 0
+#         self.last_decode_seq = 0
+
+#     def notify(self):
+#         if not self.last_packet_recv:
+#             # print("Warning: no packet received yet")
+#             return
+
+#         self.flush_half()
+
+#         # - 1 so there's leftover time to reduce rounding related issues
+#         gap = time.time() - self.last_packet_recv - 1
+#         missing = int(round(gap / 0.02, 0))
+
+#         if missing <= self.silence_threshold:
+#             return
+#         elif missing > 10000:
+#             print(f"Missing a LOT of frames for {self.ssrc}: {missing} (last: {self.last_packet_recv})")
+#             # something weird can happen where you get a fuckton of
+#             # missing frames from the calculation, not sure exactly
+#             # how to handle this yet
+#             return
+
+#         # print("Missing %s, flushing %s" % (missing, len(self.rtpheap)))
+#         self.flush_packets()
+
+#         for x in range(missing):
+#             self.decode(None)
+
+#         # Inflate stats to account for silence
+#         self.last_packet_seq += missing
+#         self.last_packet_recv += gap
+#         self.last_decode_seq += missing
+
+
+class OpusRouter(threading.Thread):
+    DELAY = Decoder.FRAME_LENGTH / 1000.0
 
     def __init__(self, output_func, *, buffer=200):
+        super().__init__()
+        self.daemon = True
+
         self.output_func = output_func
-        self.buffer_size = buffer // 20
-        self.rtpheap = []
-
-        # This is how long the router waits to pump silence (in 20ms chunks)
-        # higher values will wait longer and pump in larger chunks
-        self.silence_threshold = 10
-
-        self.last_packet_seq = 0
-        self.last_packet_recv = 0
-        self.last_decode_seq = 0
+        self.ssrc = 0
 
         self._decoder = Decoder()
-        self.ssrc = None
+        self.cycle_time = 20 # ms
+        self.last_seq = 0
+        self.last_ts = 0
+
+        # Optional diagnostic state stuff
+        self._overflow_mult = self._overflow_base = 2.0
+        self._overflow_incr = 0.5
+
+        # minimum (lower bound) size of the jitter buffer (n * 20ms per packet)
+        self.buffer_size = buffer // self._decoder.FRAME_LENGTH
+
+        self._end = threading.Event()
+        self._primed = threading.Event()
+        self._lock = threading.RLock()
+        self._buffer = []
+
+        # TODO: Add RTCP queue
+
+        self.start() # see feed() comment
+
+    def stop(self, *, flush=False):
+        if flush:
+            ... # write out the rest of buffer (set delay to 0?)
+        self._end.set()
+
+    def _push(self, item):
+        if not self._primed.is_set():
+            self._primed.set()
+
+        if not isinstance(item, RTPPacket):
+            raise TypeError(f"item should be an RTPPacket, not {item.__class__.__name__}")
+
+        # Fake packet loss
+        # import random
+        # if random.randint(1, 100) <= 10:
+        #     return
+
+        with self._lock:
+            # Replace silence packets with rtp packets
+            sp = utils.get(self._buffer, timestamp=item.timestamp)
+            if isinstance(sp, SilencePacket):
+                self._buffer[self._buffer.index(sp)] = item
+                # print([f'<{hi.__class__.__name__[:3]} seq={hi.sequence}>' for hi in self._buffer])
+                return
+            # else:
+                # ... # compare data sometime to see if its a dupe packet
+
+            bisect.insort(self._buffer, item)
+            # print([f'<{hi.__class__.__name__[0]} seq={hi.sequence}>' for hi in self._buffer])
+
+        # Optional diagnostics
+            bufsize = len(self._buffer) # indent intentional
+        if bufsize >= self.buffer_size * self._overflow_mult:
+            print(f"[router:push] Warning: rtp heap size has grown to {bufsize}")
+            self._overflow_mult += self._overflow_incr
+
+        elif bufsize <= self.buffer_size * (self._overflow_mult - self._overflow_incr) \
+            and self._overflow_mult > self._overflow_base:
+
+            print(f"[router:push] Info: rtp heap size has shrunk to {bufsize}")
+            self._overflow_mult = max(self._overflow_base, self._overflow_mult - self._overflow_incr)
+
+    def _pop(self):
+        # print(f"[router:pop] removing packet from heap ({len(self._buffer)})")
+        with self._lock:
+            if self._buffer:
+                self._buffer.append(SilencePacket(self.ssrc, self._buffer[-1].timestamp + Decoder.SAMPLES_PER_FRAME))
+                return self._buffer.pop(0), self._buffer[0] if self._buffer else None
+            else:
+                raise RuntimeError("rtp buffer is empty WHY HAS THIS HAPPENED?")
+
+    # Do not worry about this function looking horrifyingly slow, its quite fast for small buffer sizes
+    # Just kidding its worthless since silence packets DONT HAVE SEQUENCES
+    # def _fill_silence(self, perc=1.0):
+    #     return
+    #     with self._lock:
+    #         fillcount = min(self.buffer_size, self.buffer_size - self.fill_threshold - len(self._buffer))
+    #         if fillcount <= self.fill_threshold:
+    #             return
+    #
+    #         fillcount = int(fillcount/perc)
+    #         filler = []
+    #         last_seq = self._buffer[0].sequence
+    #
+    #         self._buffer.sort() # luckily timsort takes advantage of the partially sorted nature of heaps
+    #         for index, packet in enumerate(self._buffer):
+    #             if packet.sequence > last_seq + 1:
+    #                 for x in range(packet.sequence - last_seq - 1):
+    #                     filler.append(SilencePacket(self.ssrc, last_seq + x + 1))
+    #                     fillcount -= 1
+    #
+    #                 last_seq = packet.sequence
+    #                 if fillcount <= 0:
+    #                     break
+    #
+    #             last_seq = packet.sequence
+    #
+    #         if fillcount:
+    #             highest_seq = max(
+    #                 self._peekat(-1).sequence if self._buffer else 0,
+    #                 filler[-1].sequence if filler else 0
+    #             )
+    #             for x in range(fillcount):
+    #                 filler.append(SilencePacket(self.ssrc, highest_seq + x + 1))
+    #
+    #         if filler:
+    #             self._buffer = list(heapq.merge(self._buffer, filler))
+
+    def _fill_silence(self):
+        """I don't know if I need this function anymore but i'll have to check
+        how the buffer fills up initially to maybe do at least one pass at the start.
+        """
+        pass
 
     def feed(self, packet):
-        self.ssrc = packet.ssrc # dumb hack
+        # dumb hack, alternative is a defaultdict subclass that passes
+        # key from __missing__(self, key) to the factory function
+        self.ssrc = packet.ssrc
 
-        if not self.rtpheap or packet.sequence > self.rtpheap[0].sequence:
-            self.last_packet_seq = packet.sequence
-            self.last_packet_recv = time.time()
+        if self.last_ts < packet.timestamp:
+            self._push(packet)
 
-            heapq.heappush(self.rtpheap, packet)
-        else:
-            print("Rejected packet %s < %s" % (
-                packet.sequence, self.rtpheap[0].sequence))
+    def reset(self):
+        self._decoder = Decoder() # TODO: Add a reset function to Decoder itself
+        self.last_seq = self.last_ts = 0
+        self._buffer.clear()
 
-    def flush_packets(self):
-        self._flush(len(self.rtpheap))
+    def _packet_gen(self):
+        while True:
+            packet, nextpacket = self._pop()
+            self.last_ts = getattr(packet, 'timestamp', self.last_ts + Decoder.SAMPLES_PER_FRAME)
+            self.last_seq += 1 # self.last_seq = packet.sequence?
 
-    def flush_half(self):
-        self._flush(self.buffer_size//2)
+            if isinstance(packet, RTPPacket):
+                pcm = self._decoder.decode(packet.decrypted_data)
 
-    def _flush(self, count):
-        for x in range(min(len(self.rtpheap), count)):
-            packet = heapq.heappop(self.rtpheap)
-            self._add_silence(packet)
-            self.decode(packet)
+            elif isinstance(nextpacket, RTPPacket):
+                pcm = self._decoder.decode(packet.decrypted_data, fec=True)
+                fec_packet = FECPacket(self.ssrc, nextpacket.sequence - 1, nextpacket.timestamp - Decoder.SAMPLES_PER_FRAME)
+                yield fec_packet, pcm
 
-    def _add_silence(self, packet):
-        gap = packet.sequence - self.last_decode_seq
-        if gap >= 5 and self.last_decode_seq:
-            # print(f"Adding in {gap} silence frames before decode")
-            for x in range(gap):
-                self.decode(None)
+                packet, _ = self._pop()
+                self.last_ts += Decoder.SAMPLES_PER_FRAME
+                self.last_seq += 1
 
-    def decode(self, packet):
-        opus = None
-        if packet:
-            opus = packet.decrypted_data
-            self.last_decode_seq = packet.sequence
-            # print("Decoding packet %s" % packet.sequence)
-        else:
-            packet = SilencePacket(self.ssrc)
-            # TODO: Test incrementing seq in filler silence packets
+                pcm = self._decoder.decode(packet.decrypted_data)
+            else:
+                pcm = self._decoder.decode(None)
 
-        pcm = self._decoder.decode(opus)
-        opus = opus or b'\xF8\xFF\xFE'
-        self.output_func(pcm, opus, packet)
+            yield packet, pcm
 
-    def reset(self, *, flush=True):
-        # TODO optimization: check if the decoder /needs/ to be reset
-        if flush:
-            self.flush_packets()
+    # TODO: Add some way to reset to the start of this loop (another event for run() loop?)
+    def _do_run(self):
+        self._primed.wait()
+        while len(self._buffer) < self.buffer_size:
+            time.sleep(0.02)
 
-        for x in range(10):
-            self._decoder.decode(None)
+        self._fill_silence()
 
-        self.last_packet_seq = 0
-        self.last_packet_recv = 0
-        self.last_decode_seq = 0
+        start_time = time.perf_counter()
+        packet_gen = self._packet_gen()
+        loops = 0
+        try:
+            while not self._end.is_set():
+                packet, pcm = next(packet_gen)
+                self.output_func(pcm, packet.decrypted_data, packet)
 
-    def notify(self):
-        if not self.last_packet_recv:
-            # print("Warning: no packet received yet")
-            return
+                # TODO: if we fall below a certain threshold on buffer_size
+                #       somehow reduce delay for a short time until we recover
 
-        self.flush_half()
+                next_time = start_time + self.DELAY * loops
+                loops += 1
 
-        # - 1 so there's leftover time to reduce rounding related issues
-        gap = time.time() - self.last_packet_recv - 1
-        missing = int(round(gap / 0.02, 0))
+                t = time.perf_counter()
 
-        if missing <= self.silence_threshold:
-            return
-        elif missing > 10000:
-            print(f"Missing a LOT of frames for {self.ssrc}: {missing} (last: {self.last_packet_recv})")
-            # something weird can happen where you get a fuckton of
-            # missing frames from the calculation, not sure exactly
-            # how to handle this yet
-            return
+                # print(f"delay: {self.DELAY}, loop:{loops: 4}, start: {start_time:.9f}, time: {t:.9f}, elapsed: {t-start_time:.9f}, next: {next_time:.9f} sleep_for: {max(0, self.DELAY + (next_time - t)):.9f}")
+                time.sleep(max(0, self.DELAY + (next_time - time.perf_counter())))
+        finally:
+            packet_gen.close()
 
-        # print("Missing %s, flushing %s" % (missing, len(self.rtpheap)))
-        self.flush_packets()
-
-        for x in range(missing):
-            self.decode(None)
-
-        # Inflate stats to account for silence
-        self.last_packet_seq += missing
-        self.last_packet_recv += gap
-        self.last_decode_seq += missing
+    def run(self):
+        try:
+            self._do_run()
+        except Exception as e:
+            traceback.print_exc()

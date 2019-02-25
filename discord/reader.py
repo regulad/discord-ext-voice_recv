@@ -231,15 +231,16 @@ class AudioReader(threading.Thread):
 
         return header + result
 
-    def _reset_decoder(self, ssrc):
+    def _reset_decoders(self, *ssrc):
         with self._decoder_lock:
-            if ssrc is None:
+            if not ssrcs:
                 for decoder in self._decoders.values():
                     decoder.reset()
             else:
-                d = self._decoders.get(ssrc)
-                if d:
-                    d.reset()
+                for ssrc in ssrcs:
+                    d = self._decoders.get(ssrc)
+                    if d:
+                        d.reset()
 
     def _ssrc_removed(self, ssrc):
         # An user has disconnected but there still may be
@@ -256,9 +257,10 @@ class AudioReader(threading.Thread):
             if decoder is None:
                 print(f"!!! No decoder for ssrc {ssrc} was found?")
             else:
+                decoder.stop() # flush?
                 print(f"Removed decoder {ssrc}")
-                if decoder.rtpheap:
-                    print(f"Decoder had {len(decoder.rtpheap)} packets remaining")
+                # if decoder._buffer:
+                    # print(f"Decoder had {len(decoder._buffer)} packets remaining")
 
     def _get_user(self, packet):
         return self.client._ssrcs.get(packet.ssrc)
@@ -272,21 +274,6 @@ class AudioReader(threading.Thread):
             traceback.print_exc()
             # insert optional error handling here
 
-    def _notify_decoders(self):
-        with self._decoder_lock:
-            # potential optimization here, only notify those in current channel
-            for ssrc, decoder in self._decoders.items():
-                if ssrc not in self.client._ssrcs:
-                    # buffer unknown packets for now, needs testing
-                    # also need to make sure to remove decoders when ssrcs die
-                    continue
-                try:
-                    decoder.notify()
-                except Exception as e:
-                    self.fails += 1
-                    traceback.print_exc()
-                    # print(f"packets: {self.packets}, fails: {self.fails}")
-
     def _do_run(self):
         print("Starting socket loop")
         while not self._end.is_set():
@@ -298,7 +285,6 @@ class AudioReader(threading.Thread):
             if not ready:
                 if err:
                     print("Socket error")
-                self._notify_decoders()
                 continue
 
             try:
@@ -359,10 +345,6 @@ class AudioReader(threading.Thread):
                 self.packets += 1
                 self._decoders[packet.ssrc].feed(packet)
 
-            finally:
-                # print(self._decoders.items())
-                self._notify_decoders()
-
         # flush decoders?
 
     def run(self):
@@ -375,9 +357,10 @@ class AudioReader(threading.Thread):
             self._current_error = e
             self.stop()
         finally:
+            for decoder in self._decoders.values():
+                decoder.stop()
             try:
                 self._sink.cleanup()
             except:
-                # pass
-                # XXX: Testing only
+                # Testing only
                 traceback.print_exc()
