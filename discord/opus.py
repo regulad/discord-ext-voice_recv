@@ -533,8 +533,7 @@ class OpusRouter(threading.Thread):
     DELAY = Decoder.FRAME_LENGTH / 1000.0
 
     def __init__(self, output_func, *, buffer=200):
-        super().__init__()
-        self.daemon = True
+        super().__init__(daemon=True)
 
         self.output_func = output_func
         self.ssrc = 0
@@ -559,6 +558,15 @@ class OpusRouter(threading.Thread):
         # TODO: Add RTCP queue
 
         self.start() # see feed() comment
+
+    # see feed() comment
+    @property
+    def _name(self):
+        return 'ssrc-{}'.format(self.ssrc or '?')
+
+    @_name.setter
+    def _name(self, _):
+        pass
 
     def stop(self, *, flush=False):
         # Since this function can (usually is?) called from the websocket read loop,
