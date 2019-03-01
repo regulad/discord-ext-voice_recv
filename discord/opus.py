@@ -361,33 +361,28 @@ class Decoder(_OpusStruct):
         """Gets the number of samples per frame from an Opus packet"""
         return _lib.opus_packet_get_samples_per_frame(data, cls.SAMPLING_RATE)
 
-    def set_gain(self, adjustment):
+    def _set_gain(self, adjustment):
         """Configures decoder gain adjustment.
         Scales the decoded output by a factor specified in Q8 dB units.
         This has a maximum range of -32768 to 32767 inclusive, and returns
         OPUS_BAD_ARG (-1) otherwise. The default is zero indicating no adjustment.
-        This setting survives decoder reset (irrelevant).
+        This setting survives decoder reset (irrelevant for now).
 
-        gain = pow(10, x/(20.0*256))
+        gain = 10**x/(20.0*256)
 
         (from opus_defines.h)
         """
         return _lib.opus_decoder_ctl(self._state, CTL_SET_GAIN, adjustment)
 
-    def set_volume(self, volume):
-        """Sets the output volume as a float percent.  The input value is different than set_gain.
-        The math is a little bit janky but I think it probably works well enough for now.
-        """
+    def set_gain(self, dB):
+        """Sets the decoder gain in dB, from -128 to 128."""
 
-        if volume == 1:
-            return self.set_gain(0)
-        elif volume < 1:
-            volume = 1/volume
-            dB = -(5120*log10(10*log10(volume)))
-        else:
-            dB = 5120*log10(10*log10(volume))
+        dB_Q8 = max(-32768, min(32767, round(dB*256))) # dB * 2^n where n is 8 (Q8)
+        return self._set_gain(dB_Q8)
 
-        return self.set_gain(dB)
+    def set_volume(self, mult):
+        """Sets the output volume as a float percent, i.e. 0.5 for 50%, 1.75 for 175%, etc."""
+        return self.set_gain(20*log10(mult)) # amplitude ratio
 
     def _get_last_packet_duration(self):
         """Gets the duration (in samples) of the last packet successfully decoded or concealed."""
