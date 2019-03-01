@@ -423,35 +423,28 @@ class DiscordWebSocket(websockets.client.WebSocketClientProtocol):
             channel_id = data['channel_id']
             guild_id = int(data['guild_id'])
 
-            # need to handle:
-            # (X) ME changing channel (reset all decoders)
-            # (X) users moving out of MY channel (reset their decoder)
-
             # TODO: better voice call support
+            # TODO: Reseting decoders doesn't pause them.  Maybe I should just kill them?
             vc = self._connection._get_voice_client(guild_id)
             if vc:
                 user_id = int(data['user_id'])
 
-                # someone moved channels
                 if channel_id and int(channel_id) != vc.channel.id and vc._reader:
-                    # we moved channels
-                    # do I clean out the old ssrcs?
+                    # someone moved channels
                     if self._connection.user.id == user_id:
-                        ...
+                        # we moved channels
                         # print("Resetting all decoders")
-                        # vc._reader._reset_decoder(None)
+                        vc._reader._reset_decoders()
 
                     # TODO: figure out how to check if either old/new channel
                     #       is ours so we don't go around resetting decoders
                     #       for irrelevant channel moving
 
-                    # someone else moved channels
                     else:
-                        print(f"ws: Attempting to reset decoder for {user_id}")
-                        ssrc = vc._ssrcs.get(user_id)
-                        # if ssrc is not None:
-                            # print(f"Resetting decoder for ssrc {ssrc}")
-                            # vc._reader._reset_decoder(ssrc)
+                        # someone else moved channels
+                        # print(f"ws: Attempting to reset decoder for {user_id}")
+                        ssrc, _ = vc._get_ssrc_mapping(user_id=data['user_id'])
+                        vc._reader._reset_decoders(ssrc)
 
         parser = 'parse_' + event.lower()
 
@@ -746,7 +739,7 @@ class DiscordVoiceWebSocket(websockets.client.WebSocketClientProtocol):
         elif op == self.SPEAKING:
             user_id = int(data['user_id'])
             vc = self._connection
-            vc._ssrcs[data['ssrc']] = user_id
+            vc._add_ssrc(user_id, data['ssrc'])
 
             if vc.guild:
                 user = vc.guild.get_member(user_id)
@@ -756,9 +749,9 @@ class DiscordVoiceWebSocket(websockets.client.WebSocketClientProtocol):
             vc._state.dispatch('voice_speaking_update', user, data['speaking'])
 
         elif op == self.CLIENT_CONNECT:
-            self._connection._ssrcs[int(data['user_id'])] = data['audio_ssrc']
+            self._connection._add_ssrc(int(data['user_id']), data['audio_ssrc'])
         elif op == self.CLIENT_DISCONNECT:
-            self._connection._ssrcs.pop(int(data['user_id']), None)
+            self._connection._remove_ssrc(user_id=int(data['user_id']))
 
     async def initial_connection(self, data):
         state = self._connection

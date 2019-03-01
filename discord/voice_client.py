@@ -313,6 +313,38 @@ class VoiceClient:
 
     # audio related
 
+    def _add_ssrc(self, user_id, ssrc):
+        """Adds a user_id<->ssrc mapping.
+
+        Technically these can be added in either order, but using user_id as the key
+        is preferable since, should we be updating a mapping instead of adding one, we
+        want to update the ssrc for the user_id, not the other way around.
+
+        I think?  Did I write it to work like that?
+        """
+        self._ssrcs[user_id] = ssrc
+
+    def _remove_ssrc(self, *, ssrc=None, user_id=None):
+        """Removes a user_id<->ssrc mapping.  Either one can be used as the key."""
+
+        thing = ssrc or user_id
+        if not thing:
+            raise TypeError("must provide at least one argument")
+
+        other_thing = self._ssrcs.pop(thing, None)
+        if self._reader:
+            self._reader._ssrc_removed(ssrc or other_thing)
+
+    def _get_ssrc_mapping(self, *, ssrc=None, user_id=None):
+        """Returns a (ssrc, user_id) tuple from the given input.  At least one argument is required."""
+
+        thing = ssrc or user_id
+        if not thing:
+            raise TypeError("must provide at least one argument")
+
+        other_thing = self._ssrcs.get(thing)
+        return ssrc or other_thing, user_id or other_thing
+
     def _encrypt_voice_packet(self, data):
         header = bytearray(12)
 

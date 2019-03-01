@@ -561,6 +561,9 @@ class OpusRouter(threading.Thread):
         self.start() # see feed() comment
 
     def stop(self, *, flush=False):
+        # Since this function can (usually is?) called from the websocket read loop,
+        # it might not be a bad idea to return a future and set it when flushing is done
+
         if flush:
             ... # write out the rest of buffer (set delay to 0?)
         self._end.set()
@@ -663,6 +666,8 @@ class OpusRouter(threading.Thread):
             self._push(packet)
 
     def reset(self):
+        # resetting the decoder does not pause the decoder... what to do...
+        # lock?
         self._decoder = Decoder() # TODO: Add a reset function to Decoder itself
         self.last_seq = self.last_ts = 0
         self._buffer.clear()

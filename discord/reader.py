@@ -231,7 +231,7 @@ class AudioReader(threading.Thread):
 
         return header + result
 
-    def _reset_decoders(self, *ssrc):
+    def _reset_decoders(self, *ssrcs):
         with self._decoder_lock:
             if not ssrcs:
                 for decoder in self._decoders.values():
@@ -357,7 +357,7 @@ class AudioReader(threading.Thread):
             self._current_error = e
             self.stop()
         finally:
-            for decoder in self._decoders.values():
+            for decoder in list(self._decoders.values()):
                 decoder.stop()
             try:
                 self._sink.cleanup()
