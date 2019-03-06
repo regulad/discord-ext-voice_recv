@@ -33,11 +33,10 @@ import logging
 import threading
 import traceback
 
-from collections import defaultdict
-
 from . import rtp
+from .utils import Defaultdict
 from .rtp import SilencePacket
-from .opus import Decoder as OpusDecoder, OpusRouter
+from .opus import Decoder, BufferedDecoder
 
 try:
     import nacl.secret
@@ -72,9 +71,9 @@ class AudioSink:
 class WaveSink(AudioSink):
     def __init__(self, destination):
         self._file = wave.open(destination, 'wb')
-        self._file.setnchannels(OpusDecoder.CHANNELS)
-        self._file.setsampwidth(OpusDecoder.SAMPLE_SIZE//OpusDecoder.CHANNELS)
-        self._file.setframerate(OpusDecoder.SAMPLING_RATE)
+        self._file.setnchannels(Decoder.CHANNELS)
+        self._file.setsampwidth(Decoder.SAMPLE_SIZE//Decoder.CHANNELS)
+        self._file.setframerate(Decoder.SAMPLING_RATE)
 
     def write(self, data):
         self._file.writeframes(data.data)
@@ -162,13 +161,10 @@ class AudioReader(threading.Thread):
 
         self._connected = client._connected
         self._current_error = None
-        self._decoders = defaultdict(lambda: OpusRouter(self._write_to_sink))
+        self._buffers = Defaultdict(lambda ssrc: BufferedDecoder(ssrc, self._write_to_sink))
 
         self._end = threading.Event()
         self._decoder_lock = threading.Lock()
-
-        self.packets = 0
-        self.fails = 0
 
     def stop(self, *, wait=False):
         self._end.set()
@@ -234,11 +230,11 @@ class AudioReader(threading.Thread):
     def _reset_decoders(self, *ssrcs):
         with self._decoder_lock:
             if not ssrcs:
-                for decoder in self._decoders.values():
+                for decoder in self._buffers.values():
                     decoder.reset()
             else:
                 for ssrc in ssrcs:
-                    d = self._decoders.get(ssrc)
+                    d = self._buffers.get(ssrc)
                     if d:
                         d.reset()
 
@@ -250,15 +246,12 @@ class AudioReader(threading.Thread):
         # Depending on how many leftovers I end up with I may reconsider
 
         with self._decoder_lock:
-            print(f"Removing decoder for ssrc {ssrc}")
-            print(self._decoders.keys())
-            decoder = self._decoders.pop(ssrc, None)
+            decoder = self._buffers.pop(ssrc, None)
 
             if decoder is None:
                 print(f"!!! No decoder for ssrc {ssrc} was found?")
             else:
                 decoder.stop() # flush?
-                print(f"Removed decoder {ssrc}")
                 # if decoder._buffer:
                     # print(f"Decoder had {len(decoder._buffer)} packets remaining")
 
@@ -341,9 +334,9 @@ class AudioReader(threading.Thread):
                     # an ssrc-userid mapping and thats fine, but it also
                     # recreates the decoder when there are leftover packets
                     # after someone disconnects.
+                    # The RTCP timestamp offset i've been wishing for would fix this
 
-                self.packets += 1
-                self._decoders[packet.ssrc].feed(packet)
+                self._buffers[packet.ssrc].feed_rtp(packet)
 
         # flush decoders?
 
@@ -357,7 +350,7 @@ class AudioReader(threading.Thread):
             self._current_error = e
             self.stop()
         finally:
-            for decoder in list(self._decoders.values()):
+            for decoder in list(self._buffers.values()):
                 decoder.stop()
             try:
                 self._sink.cleanup()

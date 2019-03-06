@@ -28,16 +28,18 @@ import array
 import asyncio
 import collections.abc
 import unicodedata
-from base64 import b64encode
-from bisect import bisect_left
 import datetime
-from email.utils import parsedate_to_datetime
 import functools
-from inspect import isawaitable as _isawaitable
-from operator import attrgetter
 import json
 import re
 import warnings
+
+from base64 import b64encode
+from bisect import bisect_left
+from email.utils import parsedate_to_datetime
+from inspect import isawaitable as _isawaitable
+from collections import defaultdict
+from operator import attrgetter
 
 from .errors import InvalidArgument
 from .object import Object
@@ -184,6 +186,14 @@ class Bidict(dict):
     # incompatible
     # https://docs.python.org/3/library/exceptions.html#NotImplementedError, Note 1
     fromkeys = None
+
+class Defaultdict(defaultdict):
+    def __missing__(self, key):
+        if self.default_factory is None:
+            raise KeyError((key,))
+
+        self[key] = value = self.default_factory(key)
+        return value
 
 def parse_time(timestamp):
     if timestamp:
