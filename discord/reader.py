@@ -256,7 +256,9 @@ class AudioReader(threading.Thread):
                     # print(f"Decoder had {len(decoder._buffer)} packets remaining")
 
     def _get_user(self, packet):
-        return self.client._ssrcs.get(packet.ssrc)
+        _, user_id = self.client._get_ssrc_mapping(ssrc=packet.ssrc)
+        # may need to change this for calls or something
+        return self.client.guild.get_member(user_id)
 
     def _write_to_sink(self, pcm, opus, packet):
         try:
@@ -311,7 +313,13 @@ class AudioReader(threading.Thread):
                     packet = rtp.decode(self._decrypt_rtcp(raw_data))
                     if not isinstance(packet, rtp.ReceiverReportPacket):
                         print(packet)
-                    continue # oh right I don't have any way to send these yet
+
+                        # TODO: Fabricate and send SenderReports and see what happens
+
+                    for buff in list(self._buffers.values()):
+                        buff.feed_rtcp(packet)
+
+                    continue
 
             except CryptoError:
                 log.exception("CryptoError decoding packet %s", packet)

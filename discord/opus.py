@@ -413,8 +413,11 @@ class BufferedDecoder(threading.Thread):
     def __init__(self, ssrc, output_func, *, buffer=200):
         super().__init__(daemon=True, name='ssrc-%s' % ssrc)
 
-        self.output_func = output_func
+        if buffer < 40: # technically 20 works but then FEC is useless
+            raise ValueError("buffer size of %s is invalid; cannot be lower than 40" % buffer)
+
         self.ssrc = ssrc
+        self.output_func = output_func
 
         self._decoder = Decoder()
         self._buffer = []
@@ -428,29 +431,66 @@ class BufferedDecoder(threading.Thread):
         # minimum (lower bound) size of the jitter buffer (n * 20ms per packet)
         self.buffer_size = buffer // self._decoder.FRAME_LENGTH
 
-        self._end = threading.Event()
+        self._end_thread = threading.Event()
+        self._end_main_loop = threading.Event()
         self._primed = threading.Event()
         self._lock = threading.RLock()
 
         # TODO: Add RTCP queue
-
+        self._rtcp_buffer = []
 
         self.start()
 
-    def stop(self, *, flush=False):
+    def feed_rtp(self, packet):
+        if self._last_ts < packet.timestamp:
+            self._push(packet)
+
+    def feed_rtcp(self, packet):
+        ... # TODO: rotating buffer of Nones or something
+        # print(f"[router:feed] Got rtcp packet {packet}")
+        # print(f"[router:feed] Other timestamps: {[p.timestamp for p in self._buffer]}")
+        # print(f"[router:feed] Other timestamps: {self._buffer}")
+
+    def truncate(self, *, size=None):
+        """Discards old data to shrink buffer back down to buffer_size."""
+
+        size = self.buffer_size if size is None else size
+        with self._lock:
+            self._buffer = self._buffer[-size:]
+
+    def stop(self, *, flush=False, fastflush=False):
         # Since this function can (usually is?) called from the websocket read loop,
         # it might not be a bad idea to return a future and set it when flushing is done
 
-        if flush:
-            ... # write out the rest of buffer (set delay to 0?)
-        self._end.set()
+        if any(isinstance(p, RTPPacket) for p in self._buffer):
+            if fastflush:
+                # set delay to 0 and write out everything
+
+                ...
+
+            elif flush:
+                ...
+
+        self._end_thread.set()
+        self._end_main_loop.set()
+
+    def reset(self):
+        with self._lock:
+            self._decoder = Decoder() # TODO: Add a reset function to Decoder itself
+            self._last_seq = self._last_ts = 0
+            self._buffer.clear()
+            self._primed.clear()
+            self._end_main_loop.set()
 
     def _push(self, item):
-        if not self._primed.is_set():
-            self._primed.set()
-
         if not isinstance(item, (RTPPacket, SilencePacket)):
             raise TypeError(f"item should be an RTPPacket, not {item.__class__.__name__}")
+
+        if self._end_main_loop.is_set() and not self._end_thread.is_set():
+            self._end_main_loop.clear()
+
+        if not self._primed.is_set():
+            self._primed.set()
 
         # Fake packet loss
         # import random
@@ -481,16 +521,22 @@ class BufferedDecoder(threading.Thread):
             self._overflow_mult = max(self._overflow_base, self._overflow_mult - self._overflow_incr)
 
     def _pop(self):
-        # print(f"[router:pop] removing packet from heap ({len(self._buffer)})")
+        packet = nextpacket = None
         with self._lock:
-            if self._buffer:
+            try:
                 self._buffer.append(SilencePacket(self.ssrc, self._buffer[-1].timestamp + Decoder.SAMPLES_PER_FRAME))
-                return self._buffer.pop(0), self._buffer[0] if self._buffer else None
-            else:
-                raise RuntimeError("rtp buffer is empty WHY HAS THIS HAPPENED?")
+                packet = self._buffer.pop(0)
+                nextpacket = self._buffer[0]
+            except IndexError:
+                pass
+
+        return packet, nextpacket
 
     def _initial_fill(self):
         """Artisanal hand-crafted function for buffering packets and clearing discord's stupid fucking rtp buffer."""
+
+        if self._end_main_loop.is_set():
+            return
 
         # Very small sleep to check if there's buffered packets
         time.sleep(0.001)
@@ -541,24 +587,6 @@ class BufferedDecoder(threading.Thread):
         while len(self._buffer) < self.buffer_size:
             time.sleep(0.001)
 
-    def feed_rtp(self, packet):
-        if self._last_ts < packet.timestamp:
-            self._push(packet)
-
-    def reset(self):
-        # resetting the decoder does not pause the decoder... what to do...
-        # lock?
-        self._decoder = Decoder() # TODO: Add a reset function to Decoder itself
-        self._last_seq = self._last_ts = 0
-        self._buffer.clear()
-
-    def truncate(self, *, size=None):
-        """Discards old data to shrink buffer back down to buffer_size."""
-
-        size = self.buffer_size if size is None else size
-        with self._lock:
-            self._buffer = self._buffer[-size:]
-
     def _packet_gen(self):
         while True:
             packet, nextpacket = self._pop()
@@ -578,39 +606,43 @@ class BufferedDecoder(threading.Thread):
                 self._last_seq += 1
 
                 pcm = self._decoder.decode(packet.decrypted_data)
+
+            elif packet is None:
+                break
             else:
                 pcm = self._decoder.decode(None)
 
             yield packet, pcm
 
-    # TODO: Add some way to reset to the start of this loop (another event for run() loop?)
     def _do_run(self):
         self._primed.wait()
         self._initial_fill()
 
-        start_time = time.perf_counter()
-        packet_gen = self._packet_gen()
         loops = 0
+        packet_gen = self._packet_gen()
+        start_time = time.perf_counter()
         try:
-            while not self._end.is_set():
+            while not self._end_main_loop.is_set(): # and _end_thread?
                 packet, pcm = next(packet_gen)
+                if pcm is None: print(f"[router:run] PCM is None?")
                 self.output_func(pcm, packet.decrypted_data, packet)
 
                 # TODO: if we fall below a certain threshold on buffer_size
                 #       somehow reduce delay for a short time until we recover
+                #       I don't know if this will ever happen though
 
                 next_time = start_time + self.DELAY * loops
                 loops += 1
 
-                t = time.perf_counter()
-
-                # print(f"delay: {self.DELAY}, loop:{loops: 4}, start: {start_time:.9f}, time: {t:.9f}, elapsed: {t-start_time:.9f}, next: {next_time:.9f} sleep_for: {max(0, self.DELAY + (next_time - t)):.9f}")
                 time.sleep(max(0, self.DELAY + (next_time - time.perf_counter())))
+        except StopIteration:
+            time.sleep(0.001) # just in case, so we don't slam the cpu
         finally:
             packet_gen.close()
 
     def run(self):
         try:
-            self._do_run()
+            while not self._end_thread.is_set():
+                self._do_run()
         except Exception as e:
             traceback.print_exc()
