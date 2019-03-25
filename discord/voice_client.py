@@ -312,6 +312,24 @@ class VoiceClient:
         """Indicates if the voice client is connected to voice."""
         return self._connected.is_set()
 
+    async def speak(self, state):
+        """|coro|
+
+        Sets the bot's speaking state.
+        [maybe note about how the bot does this while playing audio so
+        you probably dont need to call this]
+
+        Parameters
+        -----------
+        state: :class:`SpeakingState`
+            The state to set the bot to.
+        """
+
+        if not isinstance(state, SpeakingState):
+            raise TypeError("state must be a SpeakingState not %s" % state.__class__.__name__)
+
+        await self.ws.speak(state)
+
     # audio related
 
     def _add_ssrc(self, user_id, ssrc):
