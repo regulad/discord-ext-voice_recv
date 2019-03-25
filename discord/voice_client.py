@@ -52,6 +52,7 @@ from .errors import ClientException, ConnectionClosed
 from .player import AudioPlayer, AudioSource
 from .reader import AudioReader, AudioSink
 from .utils import Bidict
+from .speakingstate import SpeakingState
 
 try:
     import nacl.secret

@@ -32,7 +32,6 @@ __all__ = (
     'ChannelType',
     'MessageType',
     'VoiceRegion',
-    'SpeakingState',
     'VerificationLevel',
     'ContentFilter',
     'Status',
