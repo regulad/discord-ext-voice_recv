@@ -32,7 +32,7 @@ from collections import namedtuple
 
 log = logging.getLogger(__name__)
 
-__all__ = ['decode', 'RTPPacket', 'RTCPPacket', 'SilencePacket']
+__all__ = ['RTPPacket', 'RTCPPacket', 'SilencePacket']
 
 
 def decode(data):

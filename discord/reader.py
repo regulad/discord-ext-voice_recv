@@ -117,19 +117,32 @@ class PCMVolumeTransformerFilter(AudioSink):
 class ConditionalFilter(AudioSink):
     def __init__(self, destination, predicate):
         self.destination = destination
-        self._predicate = predicate
+        self.predicate = predicate
 
     def write(self, data):
-        if self._predicate(data):
+        if self.predicate(data):
             self.destination.write(data)
 
 class TimedFilter(ConditionalFilter):
-    def __init__(self, destination, duration):
+    def __init__(self, destination, duration, *, start_on_init=False):
         super().__init__(destination, self._predicate)
         self.duration = duration
+        if start_on_init:
+            self.start_time = self.get_time()
+        else:
+            self.start_time = None
+            self.write = self._write_once
+
+    def _write_once(self, data):
+        self.start_time = self.get_time()
+        super().write(data)
+        self.write = super().write
 
     def _predicate(self, data):
-        return # TODO: return elapsed < duration
+        return self.start_time and self.get_time() - self.start_time < self.duration
+
+    def get_time(self):
+        return time.time()
 
 class UserFilter(ConditionalFilter):
     def __init__(self, destination, user):
@@ -149,11 +162,15 @@ class VoiceData:
         self.packet = packet
 
 class AudioReader(threading.Thread):
-    def __init__(self, sink, client):
+    def __init__(self, sink, client, *, after=None):
         threading.Thread.__init__(self)
         self.daemon = True
-        self._sink = sink
+        self.sink = sink
         self.client = client
+        self.after = after
+
+        if after is not None and not callable(after):
+            raise TypeError('Expected a callable for the "after" parameter.')
 
         self._box = nacl.secret.SecretBox(bytes(client.secret_key))
         self._decrypt_rtp = getattr(self, '_decrypt_rtp_' + client._mode)
@@ -165,11 +182,6 @@ class AudioReader(threading.Thread):
 
         self._end = threading.Event()
         self._decoder_lock = threading.Lock()
-
-    def stop(self, *, wait=False):
-        self._end.set()
-        if wait:
-            self.join()
 
     def _decrypt_rtp_xsalsa20_poly1305(self, packet):
         nonce = bytearray(24)
@@ -262,12 +274,17 @@ class AudioReader(threading.Thread):
 
     def _write_to_sink(self, pcm, opus, packet):
         try:
-            data = opus if self._sink.wants_opus() else pcm
+            data = opus if self.sink.wants_opus() else pcm
             user = self._get_user(packet)
-            self._sink.write(VoiceData(data, user, packet))
+            self.sink.write(VoiceData(data, user, packet))
         except:
             traceback.print_exc()
             # insert optional error handling here
+
+    def _set_sink(self, sink):
+        with self._decoder_lock:
+            self.sink = sink
+        # if i were to fire a sink change mini-event it would be here
 
     def _do_run(self):
         print("Starting socket loop")
@@ -276,7 +293,7 @@ class AudioReader(threading.Thread):
                 self._connected.wait()
 
             ready, _, err = select.select([self.client.socket], [],
-                                          [self.client.socket], 0.1)
+                                          [self.client.socket], 0.01)
             if not ready:
                 if err:
                     print("Socket error")
@@ -287,7 +304,7 @@ class AudioReader(threading.Thread):
             except socket.error as e:
                 t0 = time.time()
 
-                if e.errno == 10038:
+                if e.errno == 10038: # ENOTSOCK
                     continue
 
                 print(f"Socket error in reader thread: {e} {t0}")
@@ -305,7 +322,6 @@ class AudioReader(threading.Thread):
 
             try:
                 packet = None
-
                 if not rtp.is_rtcp(raw_data):
                     packet = rtp.decode(raw_data)
                     packet.decrypted_data = self._decrypt_rtp(packet)
@@ -326,42 +342,43 @@ class AudioReader(threading.Thread):
                 continue
 
             except:
-                log.exception("Error decoding packet")
+                log.exception("Error unpacking packet")
                 traceback.print_exc()
 
             else:
-                # Do I hold these packets or drop them?
                 if packet.ssrc not in self.client._ssrcs:
-                    log.debug("Unknown user for ssrc %s", packet.ssrc)
-
-                    # TODO
-                    # As expected, this is racy with users disconnecting
-                    # I'm not sure what to do about this yet
-                    # The problem is this is a 2-part problem
-                    # I can capture packets for processing before I get
-                    # an ssrc-userid mapping and thats fine, but it also
-                    # recreates the decoder when there are leftover packets
-                    # after someone disconnects.
-                    # The RTCP timestamp offset i've been wishing for would fix this
+                    log.debug("Received packet for unknown ssrc %s", packet.ssrc)
 
                 self._buffers[packet.ssrc].feed_rtp(packet)
 
-        # flush decoders?
+    def stop(self):
+        self._end.set()
 
     def run(self):
         try:
             self._do_run()
-        except socket.error as e:
+        except socket.error as exc:
+            self._current_error = exc
             self.stop()
-        except Exception as e:
+        except Exception as exc:
             traceback.print_exc()
-            self._current_error = e
+            self._current_error = exc
             self.stop()
         finally:
             for decoder in list(self._buffers.values()):
-                decoder.stop()
+                decoder.stop() # TODO: add flush args or just **kwargs to self.stop()?
             try:
-                self._sink.cleanup()
+                self.sink.cleanup()
             except:
+                log.exception("Error during sink cleanup")
                 # Testing only
                 traceback.print_exc()
+
+            self._call_after()
+
+    def _call_after(self):
+         if self.after is not None:
+            try:
+                self.after(self._current_error)
+            except Exception:
+                log.exception('Calling the after function failed.')

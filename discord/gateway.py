@@ -746,7 +746,7 @@ class DiscordVoiceWebSocket(websockets.client.WebSocketClientProtocol):
             else:
                 user = vc._state.get_user(user_id)
 
-            vc._state.dispatch('voice_speaking_update', user, SpeakingState(data['speaking']))
+            vc._state.dispatch('speaking_update', user, SpeakingState(data['speaking']))
         elif op == self.CLIENT_CONNECT:
             self._connection._add_ssrc(int(data['user_id']), data['audio_ssrc'])
         elif op == self.CLIENT_DISCONNECT:

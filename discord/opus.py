@@ -30,6 +30,7 @@ import ctypes.util
 import logging
 import sys
 import time
+import math
 import struct
 import os.path
 import sys
@@ -37,12 +38,9 @@ import bisect
 import threading
 import traceback
 
-from math import log10
-
 from . import utils
 from .rtp import RTPPacket, RTCPPacket, SilencePacket, FECPacket
 from .errors import DiscordException
-
 
 log = logging.getLogger(__name__)
 
@@ -376,12 +374,12 @@ class Decoder(_OpusStruct):
     def set_gain(self, dB):
         """Sets the decoder gain in dB, from -128 to 128."""
 
-        dB_Q8 = max(-32768, min(32767, round(dB*256))) # dB * 2^n where n is 8 (Q8)
+        dB_Q8 = max(-32768, min(32767, round(dB * 256))) # dB * 2^n where n is 8 (Q8)
         return self._set_gain(dB_Q8)
 
     def set_volume(self, mult):
         """Sets the output volume as a float percent, i.e. 0.5 for 50%, 1.75 for 175%, etc."""
-        return self.set_gain(20*log10(mult)) # amplitude ratio
+        return self.set_gain(20 * math.log10(mult)) # amplitude ratio
 
     def _get_last_packet_duration(self):
         """Gets the duration (in samples) of the last packet successfully decoded or concealed."""
@@ -447,32 +445,38 @@ class BufferedDecoder(threading.Thread):
 
     def feed_rtcp(self, packet):
         ... # TODO: rotating buffer of Nones or something
+        #           or I can store (last_seq + buffer_size, packet)
         # print(f"[router:feed] Got rtcp packet {packet}")
         # print(f"[router:feed] Other timestamps: {[p.timestamp for p in self._buffer]}")
         # print(f"[router:feed] Other timestamps: {self._buffer}")
 
     def truncate(self, *, size=None):
-        """Discards old data to shrink buffer back down to buffer_size."""
+        """Discards old data to shrink buffer back down to ``size`` (default: buffer_size).
+        TODO: doc
+        """
 
         size = self.buffer_size if size is None else size
         with self._lock:
             self._buffer = self._buffer[-size:]
 
-    def stop(self, *, flush=False, fastflush=False):
-        # Since this function can (usually is?) called from the websocket read loop,
-        # it might not be a bad idea to return a future and set it when flushing is done
+    def stop(self, *, drain=True, flush=False):
+        """
+        drain: continue to write out the remainder of the buffer at the standard rate
+        flush: write the remainder of the buffer with no delay
+        TODO: doc
+        """
 
+        self._end_thread.set()
+        self._end_main_loop.set()
+
+        # TODO: this stuff
         if any(isinstance(p, RTPPacket) for p in self._buffer):
             if fastflush:
                 # set delay to 0 and write out everything
-
                 ...
 
             elif flush:
                 ...
-
-        self._end_thread.set()
-        self._end_main_loop.set()
 
     def reset(self):
         with self._lock:
@@ -480,12 +484,13 @@ class BufferedDecoder(threading.Thread):
             self._last_seq = self._last_ts = 0
             self._buffer.clear()
             self._primed.clear()
-            self._end_main_loop.set()
+            self._end_main_loop.set() # XXX: racy with _push?
 
     def _push(self, item):
         if not isinstance(item, (RTPPacket, SilencePacket)):
             raise TypeError(f"item should be an RTPPacket, not {item.__class__.__name__}")
 
+        # XXX: racy with reset?
         if self._end_main_loop.is_set() and not self._end_thread.is_set():
             self._end_main_loop.clear()
 
@@ -503,7 +508,7 @@ class BufferedDecoder(threading.Thread):
                 # Replace silence packets with rtp packets
                 self._buffer[self._buffer.index(existing_packet)] = item
                 return
-            elif isinstance(existing_packet, RTPPacket):
+            elif isinstance(existing_packet, RTPPacket): # if existing_packet is not None?
                 return # duplicate packet
 
             bisect.insort(self._buffer, item)
@@ -528,7 +533,7 @@ class BufferedDecoder(threading.Thread):
                 packet = self._buffer.pop(0)
                 nextpacket = self._buffer[0]
             except IndexError:
-                pass
+                pass # empty buffer
 
         return packet, nextpacket
 
@@ -564,11 +569,11 @@ class BufferedDecoder(threading.Thread):
 
             # decide if there's a jump
             jump1, jump2 = sdiffs[:2]
-            if jump1 > jump2*3:
+            if jump1 > jump2 * 3:
                 # remove the stale packets and keep the fresh ones
                 self.truncate(size=len(self._buffer[diffs.index(jump1)+1:]))
             else:
-                # otherwise they're all stale, dump 'em
+                # otherwise they're all stale, dump 'em (does this ever happen?)
                 with self._lock:
                     self._buffer.clear()
 
@@ -586,6 +591,8 @@ class BufferedDecoder(threading.Thread):
         # now fill the rest
         while len(self._buffer) < self.buffer_size:
             time.sleep(0.001)
+            # TODO: Maybe only wait at most for about as long we we're supposed to?
+            #       0.02 * (buffersize - len(buffer))
 
     def _packet_gen(self):
         while True:

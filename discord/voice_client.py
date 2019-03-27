@@ -398,6 +398,41 @@ class VoiceClient:
 
         return header + box.encrypt(bytes(data), bytes(nonce)).ciphertext + nonce[:4]
 
+    def send_audio_packet(self, data, *, encode=True):
+        """Sends an audio packet composed of the data.
+
+        You must be connected to play audio.
+
+        Parameters
+        ----------
+        data: :class:`bytes`
+            The :term:`py:bytes-like object` denoting PCM or Opus voice data.
+        encode: :class:`bool`
+            Indicates if ``data`` should be encoded into Opus.
+
+        Raises
+        -------
+        ClientException
+            You are not connected.
+        opus.OpusError
+            Encoding the data failed.
+        """
+
+        self.checked_add('sequence', 1, 65535)
+        if encode:
+            encoded_data = self.encoder.encode(data, self.encoder.SAMPLES_PER_FRAME)
+        else:
+            encoded_data = data
+        packet = self._encrypt_voice_packet(encoded_data)
+        try:
+            self.socket.sendto(packet, (self.endpoint_ip, self.voice_port))
+        except BlockingIOError:
+            log.warning('A packet has been dropped (seq: %s, timestamp: %s)', self.sequence, self.timestamp)
+
+        self.checked_add('timestamp', self.encoder.SAMPLES_PER_FRAME, 4294967295)
+
+    # send api related
+
     def play(self, source, *, after=None):
         """Plays an :class:`AudioSource`.
 
@@ -434,7 +469,7 @@ class VoiceClient:
             raise ClientException('Already playing audio.')
 
         if not isinstance(source, AudioSource):
-            raise TypeError('source must an AudioSource not {0.__class__.__name__}'.format(source))
+            raise TypeError('source must be an AudioSource not {0.__class__.__name__}'.format(source))
 
         if not self.encoder and not source.is_opus():
             self.encoder = opus.Encoder()
@@ -484,41 +519,10 @@ class VoiceClient:
 
         self._player._set_source(value)
 
-    def send_audio_packet(self, data, *, encode=True):
-        """Sends an audio packet composed of the data.
-
-        You must be connected to play audio.
-
-        Parameters
-        ----------
-        data: :class:`bytes`
-            The :term:`py:bytes-like object` denoting PCM or Opus voice data.
-        encode: :class:`bool`
-            Indicates if ``data`` should be encoded into Opus.
-
-        Raises
-        -------
-        ClientException
-            You are not connected.
-        opus.OpusError
-            Encoding the data failed.
-        """
-
-        self.checked_add('sequence', 1, 65535)
-        if encode:
-            encoded_data = self.encoder.encode(data, self.encoder.SAMPLES_PER_FRAME)
-        else:
-            encoded_data = data
-        packet = self._encrypt_voice_packet(encoded_data)
-        try:
-            self.socket.sendto(packet, (self.endpoint_ip, self.voice_port))
-        except BlockingIOError:
-            log.warning('A packet has been dropped (seq: %s, timestamp: %s)', self.sequence, self.timestamp)
-
-        self.checked_add('timestamp', opus.Encoder.SAMPLES_PER_FRAME, 4294967295)
+    # receive api related
 
     def listen(self, sink):
-        """Receives audio into a :class:`AudioSource`. TODO: wording?
+        """Receives audio into a :class:`AudioSink`. TODO: wording
 
         TODO: the rest of it
         """
@@ -527,7 +531,7 @@ class VoiceClient:
             raise ClientException('Not connected to voice.')
 
         if not isinstance(sink, AudioSink):
-            raise TypeError('sink must an AudioSink not {0.__class__.__name__}'.format(sink))
+            raise TypeError('sink must be an AudioSink not {0.__class__.__name__}'.format(sink))
 
         if self.is_listening():
             raise ClientException('Already receiving audio.')
@@ -544,6 +548,20 @@ class VoiceClient:
         if self._reader:
             self._reader.stop()
             self._reader = None
+
+    @property
+    def sink(self):
+        return self._reader.sink if self._reader else None
+
+    @sink.setter
+    def sink(self, value):
+        if not isinstance(value, AudioSink):
+            raise TypeError('expected AudioSink not {0.__class__.__name__}.'.format(value))
+
+        if self._reader is None:
+            raise ValueError('Not receiving anything.')
+
+        self._reader._set_sink(sink)
 
     def stop(self):
         """Stops playing and receiving audio."""
