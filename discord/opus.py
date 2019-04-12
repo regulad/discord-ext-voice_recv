@@ -421,6 +421,7 @@ class BufferedDecoder(threading.Thread):
         self._buffer = []
         self._last_seq = 0
         self._last_ts = 0
+        self._loops = 0
 
         # Optional diagnostic state stuff
         self._overflow_mult = self._overflow_base = 2.0
@@ -429,6 +430,7 @@ class BufferedDecoder(threading.Thread):
         # minimum (lower bound) size of the jitter buffer (n * 20ms per packet)
         self.buffer_size = buffer // self._decoder.FRAME_LENGTH
 
+        self._finalizing = False
         self._end_thread = threading.Event()
         self._end_main_loop = threading.Event()
         self._primed = threading.Event()
@@ -442,6 +444,8 @@ class BufferedDecoder(threading.Thread):
     def feed_rtp(self, packet):
         if self._last_ts < packet.timestamp:
             self._push(packet)
+        elif self._end_thread.is_set():
+            return
 
     def feed_rtcp(self, packet):
         ... # TODO: rotating buffer of Nones or something
@@ -459,24 +463,25 @@ class BufferedDecoder(threading.Thread):
         with self._lock:
             self._buffer = self._buffer[-size:]
 
-    def stop(self, *, drain=True, flush=False):
+    def stop(self, **kwargs):
         """
-        drain: continue to write out the remainder of the buffer at the standard rate
-        flush: write the remainder of the buffer with no delay
+        drain=True: continue to write out the remainder of the buffer at the standard rate
+        flush=False: write the remainder of the buffer with no delay
         TODO: doc
         """
 
-        self._end_thread.set()
-        self._end_main_loop.set()
+        with self._lock:
+            self._end_thread.set()
+            self._end_main_loop.set()
 
-        # TODO: this stuff
-        if any(isinstance(p, RTPPacket) for p in self._buffer):
-            if fastflush:
-                # set delay to 0 and write out everything
-                ...
-
-            elif flush:
-                ...
+            if any(isinstance(p, RTPPacket) for p in self._buffer) or True:
+                if kwargs.pop('flush', False):
+                    self._finalizing = True
+                    self.DELAY = 0
+                elif not kwargs.pop('drain', True):
+                    with self._lock:
+                        self._finalizing = True
+                        self._buffer.clear()
 
     def reset(self):
         with self._lock:
@@ -485,6 +490,7 @@ class BufferedDecoder(threading.Thread):
             self._buffer.clear()
             self._primed.clear()
             self._end_main_loop.set() # XXX: racy with _push?
+            self.DELAY = self.__class__.DELAY
 
     def _push(self, item):
         if not isinstance(item, (RTPPacket, SilencePacket)):
@@ -508,7 +514,7 @@ class BufferedDecoder(threading.Thread):
                 # Replace silence packets with rtp packets
                 self._buffer[self._buffer.index(existing_packet)] = item
                 return
-            elif isinstance(existing_packet, RTPPacket): # if existing_packet is not None?
+            elif isinstance(existing_packet, RTPPacket):
                 return # duplicate packet
 
             bisect.insort(self._buffer, item)
@@ -529,7 +535,8 @@ class BufferedDecoder(threading.Thread):
         packet = nextpacket = None
         with self._lock:
             try:
-                self._buffer.append(SilencePacket(self.ssrc, self._buffer[-1].timestamp + Decoder.SAMPLES_PER_FRAME))
+                if not self._finalizing:
+                    self._buffer.append(SilencePacket(self.ssrc, self._buffer[-1].timestamp + Decoder.SAMPLES_PER_FRAME))
                 packet = self._buffer.pop(0)
                 nextpacket = self._buffer[0]
             except IndexError:
@@ -550,13 +557,11 @@ class BufferedDecoder(threading.Thread):
             # we need to figure out where the old packets stop and where the fresh ones begin
             # for that we need to see when we return to the normal packet accumulation rate
 
-            with self._lock:
-                last_size = len(self._buffer)
+            last_size = len(self._buffer)
 
             # wait until we have the correct rate of packet ingress
             while len(self._buffer) - last_size > 1:
-                with self._lock:
-                    last_size = len(self._buffer)
+                last_size = len(self._buffer)
                 time.sleep(0.001)
 
             # collect some fresh packets
@@ -583,9 +588,9 @@ class BufferedDecoder(threading.Thread):
 
         # fill the buffer with silence aligned with the first packet
         # if an rtp packet already exists for the given silence packet ts, the silence packet is ignored
-        start_ts = self._buffer[0].timestamp
-        for x in range(1, 1 + self.buffer_size - len(self._buffer)):
-            with self._lock:
+        with self._lock:
+            start_ts = self._buffer[0].timestamp
+            for x in range(1, 1 + self.buffer_size - len(self._buffer)):
                 self._push(SilencePacket(self.ssrc, start_ts + x * Decoder.SAMPLES_PER_FRAME))
 
         # now fill the rest
@@ -615,6 +620,7 @@ class BufferedDecoder(threading.Thread):
                 pcm = self._decoder.decode(packet.decrypted_data)
 
             elif packet is None:
+                self._finalizing = False
                 break
             else:
                 pcm = self._decoder.decode(None)
@@ -625,21 +631,20 @@ class BufferedDecoder(threading.Thread):
         self._primed.wait()
         self._initial_fill()
 
-        loops = 0
+        self._loops = 0
         packet_gen = self._packet_gen()
         start_time = time.perf_counter()
         try:
-            while not self._end_main_loop.is_set(): # and _end_thread?
+            while not self._end_main_loop.is_set() or self._finalizing:
                 packet, pcm = next(packet_gen)
-                if pcm is None: print(f"[router:run] PCM is None?")
-                self.output_func(pcm, packet.decrypted_data, packet)
+                try:
+                    self.output_func(pcm, packet.decrypted_data, packet)
+                except:
+                    log.exception("Sink raised exception")
+                    traceback.print_exc()
 
-                # TODO: if we fall below a certain threshold on buffer_size
-                #       somehow reduce delay for a short time until we recover
-                #       I don't know if this will ever happen though
-
-                next_time = start_time + self.DELAY * loops
-                loops += 1
+                next_time = start_time + self.DELAY * self._loops
+                self._loops += 1
 
                 time.sleep(max(0, self.DELAY + (next_time - time.perf_counter())))
         except StopIteration:
@@ -652,4 +657,5 @@ class BufferedDecoder(threading.Thread):
             while not self._end_thread.is_set():
                 self._do_run()
         except Exception as e:
+            log.exception("Error in decoder %s", self.name)
             traceback.print_exc()

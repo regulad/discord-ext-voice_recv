@@ -37,6 +37,7 @@ from . import rtp
 from .utils import Defaultdict
 from .rtp import SilencePacket
 from .opus import Decoder, BufferedDecoder
+from .errors import DiscordException
 
 try:
     import nacl.secret
@@ -53,7 +54,24 @@ __all__ = [
     'ConditionalFilter',
     'TimedFilter',
     'UserFilter',
+    'SinkExit'
 ]
+
+class SinkExit(DiscordException):
+    """A signal type exception (like ``GeneratorExit``) to raise in a Sink's write() method to stop it.
+
+    TODO: make better words
+
+    Parameters
+    -----------
+    drain: :class:`bool`
+        ...
+    flush: :class:`bool`
+        ...
+    """
+
+    def __init__(self, *, drain=True, flush=False):
+        self.kwargs = kwargs
 
 class AudioSink:
     def __del__(self):
@@ -163,8 +181,7 @@ class VoiceData:
 
 class AudioReader(threading.Thread):
     def __init__(self, sink, client, *, after=None):
-        threading.Thread.__init__(self)
-        self.daemon = True
+        super().__init__(daemon=True)
         self.sink = sink
         self.client = client
         self.after = after
@@ -250,6 +267,17 @@ class AudioReader(threading.Thread):
                     if d:
                         d.reset()
 
+    def _stop_decoders(self, *ssrcs, **kwargs):
+        with self._decoder_lock:
+            if not ssrcs:
+                for decoder in self._buffers.values():
+                    decoder.stop(**kwargs)
+            else:
+                for ssrc in ssrcs:
+                    decoder = self._buffers.get(ssrc)
+                    if decoder:
+                        decoder.stop(**kwargs)
+
     def _ssrc_removed(self, ssrc):
         # An user has disconnected but there still may be
         # packets from them left in the buffer to read
@@ -263,7 +291,7 @@ class AudioReader(threading.Thread):
             if decoder is None:
                 print(f"!!! No decoder for ssrc {ssrc} was found?")
             else:
-                decoder.stop() # flush?
+                decoder.stop()
                 # if decoder._buffer:
                     # print(f"Decoder had {len(decoder._buffer)} packets remaining")
 
@@ -277,6 +305,10 @@ class AudioReader(threading.Thread):
             data = opus if self.sink.wants_opus() else pcm
             user = self._get_user(packet)
             self.sink.write(VoiceData(data, user, packet))
+        except SinkExit as e:
+            log.info("Shutting down reader thread %s", self)
+            self.stop()
+            self._stop_decoders(**e.kwargs)
         except:
             traceback.print_exc()
             # insert optional error handling here
@@ -287,7 +319,6 @@ class AudioReader(threading.Thread):
         # if i were to fire a sink change mini-event it would be here
 
     def _do_run(self):
-        print("Starting socket loop")
         while not self._end.is_set():
             if not self._connected.is_set():
                 self._connected.wait()
@@ -307,6 +338,7 @@ class AudioReader(threading.Thread):
                 if e.errno == 10038: # ENOTSOCK
                     continue
 
+                log.exception("Socket error in reader thread ")
                 print(f"Socket error in reader thread: {e} {t0}")
 
                 with self.client._connecting:
@@ -365,8 +397,7 @@ class AudioReader(threading.Thread):
             self._current_error = exc
             self.stop()
         finally:
-            for decoder in list(self._buffers.values()):
-                decoder.stop() # TODO: add flush args or just **kwargs to self.stop()?
+            self._stop_decoders()
             try:
                 self.sink.cleanup()
             except:
@@ -382,3 +413,6 @@ class AudioReader(threading.Thread):
                 self.after(self._current_error)
             except Exception:
                 log.exception('Calling the after function failed.')
+
+    def is_listening(self):
+        return not self._end.is_set()

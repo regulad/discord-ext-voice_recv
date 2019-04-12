@@ -541,7 +541,7 @@ class VoiceClient:
 
     def is_listening(self):
         """Indicates if we're currently receiving audio."""
-        return self._reader is not None
+        return self._reader is not None and self._reader.is_listening()
 
     def stop_listening(self):
         """Stops receiving audio."""
