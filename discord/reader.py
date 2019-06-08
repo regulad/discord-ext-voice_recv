@@ -189,21 +189,31 @@ class AudioReader(threading.Thread):
         if after is not None and not callable(after):
             raise TypeError('Expected a callable for the "after" parameter.')
 
-        self._box = nacl.secret.SecretBox(bytes(client.secret_key))
-        self._decrypt_rtp = getattr(self, '_decrypt_rtp_' + client._mode)
-        self._decrypt_rtcp = getattr(self, '_decrypt_rtcp_' + client._mode)
+        if filter is not None and not callable(filter):
+            raise TypeError('Expected a callable for the "filter" parameter.')
 
-        self._connected = client._connected
+
+        self.box = nacl.secret.SecretBox(bytes(client.secret_key))
+        self.decrypt_rtp = getattr(self, '_decrypt_rtp_' + client._mode)
+        self.decrypt_rtcp = getattr(self, '_decrypt_rtcp_' + client._mode)
+
         self._current_error = None
-        self._buffers = Defaultdict(lambda ssrc: BufferedDecoder(ssrc, self._write_to_sink))
-
         self._end = threading.Event()
         self._decoder_lock = threading.Lock()
+
+        self.decoder = BufferedDecoder(self._write_to_sink)
+        self.decoder.start()
+
+        # TODO: inject sink functions
+
+    @property
+    def connected(self):
+        return self.client._connected
 
     def _decrypt_rtp_xsalsa20_poly1305(self, packet):
         nonce = bytearray(24)
         nonce[:12] = packet.header
-        result = self._box.decrypt(bytes(packet.data), bytes(nonce))
+        result = self.box.decrypt(bytes(packet.data), bytes(nonce))
 
         if packet.extended:
             offset = packet.update_ext_headers(result)
@@ -214,14 +224,14 @@ class AudioReader(threading.Thread):
     def _decrypt_rtcp_xsalsa20_poly1305(self, data):
         nonce = bytearray(24)
         nonce[:8] = data[:8]
-        result = self._box.decrypt(data[8:], bytes(nonce))
+        result = self.box.decrypt(data[8:], bytes(nonce))
 
         return data[:8] + result
 
     def _decrypt_rtp_xsalsa20_poly1305_suffix(self, packet):
         nonce = packet.data[-24:]
         voice_data = packet.data[:-24]
-        result = self._box.decrypt(bytes(voice_data), bytes(nonce))
+        result = self.box.decrypt(bytes(voice_data), bytes(nonce))
 
         if packet.extended:
             offset = packet.update_ext_headers(result)
@@ -232,7 +242,7 @@ class AudioReader(threading.Thread):
     def _decrypt_rtcp_xsalsa20_poly1305_suffix(self, data):
         nonce = data[-24:]
         header = data[:8]
-        result = self._box.decrypt(data[8:-24], nonce)
+        result = self.box.decrypt(data[8:-24], nonce)
 
         return header + result
 
@@ -240,7 +250,7 @@ class AudioReader(threading.Thread):
         nonce = bytearray(24)
         nonce[:4] = packet.data[-4:]
         voice_data = packet.data[:-4]
-        result = self._box.decrypt(bytes(voice_data), bytes(nonce))
+        result = self.box.decrypt(bytes(voice_data), bytes(nonce))
 
         if packet.extended:
             offset = packet.update_ext_headers(result)
@@ -252,31 +262,17 @@ class AudioReader(threading.Thread):
         nonce = bytearray(24)
         nonce[:4] = data[-4:]
         header = data[:8]
-        result = self._box.decrypt(data[8:-4], bytes(nonce))
+        result = self.box.decrypt(data[8:-4], bytes(nonce))
 
         return header + result
 
     def _reset_decoders(self, *ssrcs):
         with self._decoder_lock:
-            if not ssrcs:
-                for decoder in self._buffers.values():
-                    decoder.reset()
-            else:
-                for ssrc in ssrcs:
-                    d = self._buffers.get(ssrc)
-                    if d:
-                        d.reset()
+            self.decoder.reset(*ssrcs)
 
-    def _stop_decoders(self, *ssrcs, **kwargs):
+    def _stop_decoders(self, **kwargs):
         with self._decoder_lock:
-            if not ssrcs:
-                for decoder in self._buffers.values():
-                    decoder.stop(**kwargs)
-            else:
-                for ssrc in ssrcs:
-                    decoder = self._buffers.get(ssrc)
-                    if decoder:
-                        decoder.stop(**kwargs)
+            self.decoder.stop(**kwargs)
 
     def _ssrc_removed(self, ssrc):
         # An user has disconnected but there still may be
@@ -286,14 +282,7 @@ class AudioReader(threading.Thread):
         # Depending on how many leftovers I end up with I may reconsider
 
         with self._decoder_lock:
-            decoder = self._buffers.pop(ssrc, None)
-
-            if decoder is None:
-                print(f"!!! No decoder for ssrc {ssrc} was found?")
-            else:
-                decoder.stop()
-                # if decoder._buffer:
-                    # print(f"Decoder had {len(decoder._buffer)} packets remaining")
+            self.decoder.drop_ssrc(ssrc) # flush=True?
 
     def _get_user(self, packet):
         _, user_id = self.client._get_ssrc_mapping(ssrc=packet.ssrc)
@@ -305,6 +294,7 @@ class AudioReader(threading.Thread):
             data = opus if self.sink.wants_opus() else pcm
             user = self._get_user(packet)
             self.sink.write(VoiceData(data, user, packet))
+            # TODO: remove weird error handling in favor of injected functions
         except SinkExit as e:
             log.info("Shutting down reader thread %s", self)
             self.stop()
@@ -320,8 +310,8 @@ class AudioReader(threading.Thread):
 
     def _do_run(self):
         while not self._end.is_set():
-            if not self._connected.is_set():
-                self._connected.wait()
+            if not self.connected.is_set():
+                self.connected.wait()
 
             ready, _, err = select.select([self.client.socket], [],
                                           [self.client.socket], 0.01)
@@ -356,17 +346,15 @@ class AudioReader(threading.Thread):
                 packet = None
                 if not rtp.is_rtcp(raw_data):
                     packet = rtp.decode(raw_data)
-                    packet.decrypted_data = self._decrypt_rtp(packet)
+                    packet.decrypted_data = self.decrypt_rtp(packet)
                 else:
-                    packet = rtp.decode(self._decrypt_rtcp(raw_data))
+                    packet = rtp.decode(self.decrypt_rtcp(raw_data))
                     if not isinstance(packet, rtp.ReceiverReportPacket):
                         print(packet)
 
                         # TODO: Fabricate and send SenderReports and see what happens
 
-                    for buff in list(self._buffers.values()):
-                        buff.feed_rtcp(packet)
-
+                    self.decoder.feed_rtcp(packet)
                     continue
 
             except CryptoError:
@@ -381,7 +369,8 @@ class AudioReader(threading.Thread):
                 if packet.ssrc not in self.client._ssrcs:
                     log.debug("Received packet for unknown ssrc %s", packet.ssrc)
 
-                self._buffers[packet.ssrc].feed_rtp(packet)
+                if self.filter and self.filter(packet):
+                    self.decoder.feed_rtp(packet)
 
     def stop(self):
         self._end.set()
