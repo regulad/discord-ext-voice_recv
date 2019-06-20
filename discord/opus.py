@@ -775,6 +775,34 @@ class BufferedPacketDecoder(BasePacketDecoder):
         return packet, nextpacket # return rtcp packets as well?
 
     def _packet_gen(self):
+        # Buffer packets
+        # do I care about dumping buffered packets on reset?
+
+        # Ok yes this section is going to look weird.  To keep everything consistant I need to
+        # wait for a specific number of iterations instead of on the actual buffer size.  These
+        # objects are supposed to be time naive.  The class handling these is responsible for
+        # keeping the time synchronization.
+
+        # How many packets we already have
+        pre_fill = len(self._buffer)
+        # How many packets we need to get to half full
+        half_fill = max(0, self.buffer_size//2 - 1 - pre_fill)
+        # How many packets we need to get to full
+        full_fill = self.buffer_size - half_fill
+
+        print(f"Starting with {pre_fill}, collecting {half_fill}, then {full_fill}")
+
+        for x in range(half_fill):
+            yield None, None
+
+        with self._lock:
+            start_ts = self._buffer[0].timestamp
+            for x in range(1, 1 + self.buffer_size - len(buff)):
+                self._push(SilencePacket(self.ssrc, start_ts + x * Decoder.SAMPLES_PER_FRAME))
+
+        for x in range(full_fill):
+            yield None, None
+
         while True:
             packet, nextpacket = self._pop()
             self._last_ts = getattr(packet, 'timestamp', self._last_ts + Decoder.SAMPLES_PER_FRAME)
@@ -805,19 +833,31 @@ class BufferedPacketDecoder(BasePacketDecoder):
 class BufferedDecoder(threading.Thread):
     """Ingests rtp packets and dispatches to decoders and sink output function."""
 
-    def __init__(self, output_func, *, decodercls=BufferedPacketDecoder):
+    def __init__(self, reader, *, decodercls=BufferedPacketDecoder):
         super().__init__(daemon=True, name='DecoderBuffer')
-        self.output_func = output_func
+        self.reader = reader
         self.decodercls = decodercls
-        self.decoders = {}
 
-        # TODO: Move lock from reader to here
+        self.output_func = reader._write_to_sink
+        self.decoders = {}
+        self.initial_buffer = []
+        self.timers = []
+
+        self._end_thread = threading.Event()
+        self._lock = threading.Lock()
+        self._waiter = threading.Condition()
 
     def _get_decoder(self, ssrc):
         dec = self.decoders.get(ssrc)
-        if not dec:
+        if not dec and self.reader.client._get_ssrc_mapping(ssrc=ssrc)[1]: # and get_user(ssrc)
             dec = self.decoders[ssrc] = self.decodercls(ssrc)
+            dec.start_time = 0
+            dec.loops = 0
         return dec
+
+    def _feed_rtp_initial(self, packet):
+        with self._lock:
+            self.initial_buffer.append(packet)
 
     def feed_rtp(self, packet):
         self._get_decoder(packet.ssrc).feed_rtp(packet)
@@ -826,20 +866,20 @@ class BufferedDecoder(threading.Thread):
         self._get_decoder(packet.ssrc).feed_rtcp(packet)
 
     def drop_ssrc(self, ssrc):
-        dec = self.decoders.get(ssrc)
+        dec = self.decoders.pop(ssrc, None)
         if dec:
             # dec/self.flush()?
             dec.reset()
-            del self.decoders[dec]
 
     def reset(self, *ssrcs):
-        if not ssrcs:
-            ssrcs = tuple(self.decoders.keys())
+        with self._lock:
+            if not ssrcs:
+                ssrcs = tuple(self.decoders.keys())
 
-        for ssrc in ssrcs:
-            dec = self.decoders.get(ssrc)
-            if dec:
-                dec.reset()
+            for ssrc in ssrcs:
+                dec = self.decoders.get(ssrc)
+                if dec:
+                    dec.reset()
 
     def flush(self, *ssrcs):
         ...
@@ -852,7 +892,107 @@ class BufferedDecoder(threading.Thread):
 
     def _initial_fill(self):
         # Fill a single buffer first then dispense into the actual buffers
-        ...
+        try:
+            normal_feed_rtp = self.feed_rtp
+            self.feed_rtp = self._feed_rtp_initial
+
+            buff = self.initial_buffer
+
+            # Very small sleep to check if there's buffered packets
+            time.sleep(0.002)
+            if len(buff) > 3:
+                # looks like there's some old packets in the buffer
+                # we need to figure out where the old packets stop and where the fresh ones begin
+                # for that we need to see when we return to the normal packet accumulation rate
+
+                last_size = len(buff)
+
+                # wait until we have the correct rate of packet ingress
+                while len(buff) - last_size > 1:
+                    last_size = len(buff)
+                    time.sleep(0.001)
+
+                # collect some fresh packets
+                time.sleep(0.06)
+
+                # generate list of differences between packet sequences
+                with self._lock:
+                    diffs = [buff[i+1].sequence - buff[i].sequence for i in range(len(buff)-1)]
+                sdiffs = sorted(diffs, reverse=True)
+
+                # decide if there's a jump
+                jump1, jump2 = sdiffs[:2]
+                if jump1 > jump2 * 3:
+                    # remove the stale packets and keep the fresh ones
+                    with self._lock:
+                        size = len(buff[diffs.index(jump1)+1:])
+                        buff = buff[-size:]
+                else:
+                    # otherwise they're all stale, dump 'em (does this ever happen?)
+                    with self._lock:
+                        buff.clear()
+
+            # The old version of this code backfilled buffers based on the buffer size.
+            # We dont have that here but we can just have the individual buffer objects
+            # backfill themselves.
+
+            # Dump initial buffer into actual buffers
+            with self._lock:
+                for packet in buff:
+                    normal_feed_rtp(packet)
+
+                self.feed_rtp = normal_feed_rtp
+        finally:
+            self.feed_rtp = normal_feed_rtp
+
+    def decode(self, decoder):
+        packet, pcm = next(decoder)
+        try:
+            self.output_func(pcm, packet.decrypted_data, packet)
+        except:
+            log.exception("Sink raised exception")
+            traceback.print_exc()
+
+        decoder.loops += 1
+        decoder.next_time = decoder.start_time + self.DELAY * decoder.loops
+        self.timers.append((decoder.next_time, decoder))
+
+    def _do_run(self):
+        while not self._end_thread.is_set():
+            for decoder in tuple(self.decoders.values()):
+                # if time >= nexttime:
+                self.decode(decoder)
+
+
 
     def run(self):
-        ...
+        try:
+            self._do_run()
+        except Exception as e:
+            log.exception("Error in decoder %s", self.name)
+            traceback.print_exc()
+
+    def asfdasdfasdfasdfasdf(self):
+        self._primed.wait()
+        self._initial_fill()
+
+        self._loops = 0
+        packet_gen = self._packet_gen()
+        start_time = time.perf_counter()
+        try:
+            while not self._end_main_loop.is_set() or self._finalizing:
+                packet, pcm = next(packet_gen)
+                try:
+                    self.output_func(pcm, packet.decrypted_data, packet)
+                except:
+                    log.exception("Sink raised exception")
+                    traceback.print_exc()
+
+                next_time = start_time + self.DELAY * self._loops
+                self._loops += 1
+
+                time.sleep(max(0, self.DELAY + (next_time - time.perf_counter())))
+        except StopIteration:
+            time.sleep(0.001) # just in case, so we don't slam the cpu
+        finally:
+            packet_gen.close()

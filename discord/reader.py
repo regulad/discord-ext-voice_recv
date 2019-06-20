@@ -192,6 +192,8 @@ class AudioReader(threading.Thread):
         if filter is not None and not callable(filter):
             raise TypeError('Expected a callable for the "filter" parameter.')
 
+        self.after = after
+        self.filter = filter
 
         self.box = nacl.secret.SecretBox(bytes(client.secret_key))
         self.decrypt_rtp = getattr(self, '_decrypt_rtp_' + client._mode)
@@ -267,12 +269,10 @@ class AudioReader(threading.Thread):
         return header + result
 
     def _reset_decoders(self, *ssrcs):
-        with self._decoder_lock:
-            self.decoder.reset(*ssrcs)
+        self.decoder.reset(*ssrcs)
 
     def _stop_decoders(self, **kwargs):
-        with self._decoder_lock:
-            self.decoder.stop(**kwargs)
+        self.decoder.stop(**kwargs)
 
     def _ssrc_removed(self, ssrc):
         # An user has disconnected but there still may be
@@ -281,8 +281,7 @@ class AudioReader(threading.Thread):
         # I *think* this is the correct way to do this
         # Depending on how many leftovers I end up with I may reconsider
 
-        with self._decoder_lock:
-            self.decoder.drop_ssrc(ssrc) # flush=True?
+        self.decoder.drop_ssrc(ssrc) # flush=True?
 
     def _get_user(self, packet):
         _, user_id = self.client._get_ssrc_mapping(ssrc=packet.ssrc)
