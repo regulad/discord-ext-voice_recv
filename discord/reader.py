@@ -86,6 +86,9 @@ class AudioSink:
     def cleanup(self):
         pass
 
+    def pack_data(self, data, user=None, packet=None):
+        return VoiceData(data, user, packet) # is this even necessary?
+
 class WaveSink(AudioSink):
     def __init__(self, destination):
         self._file = wave.open(destination, 'wb')
@@ -189,11 +192,7 @@ class AudioReader(threading.Thread):
         if after is not None and not callable(after):
             raise TypeError('Expected a callable for the "after" parameter.')
 
-        if filter is not None and not callable(filter):
-            raise TypeError('Expected a callable for the "filter" parameter.')
-
         self.after = after
-        self.filter = filter
 
         self.box = nacl.secret.SecretBox(bytes(client.secret_key))
         self.decrypt_rtp = getattr(self, '_decrypt_rtp_' + client._mode)
@@ -203,7 +202,7 @@ class AudioReader(threading.Thread):
         self._end = threading.Event()
         self._decoder_lock = threading.Lock()
 
-        self.decoder = BufferedDecoder(self._write_to_sink)
+        self.decoder = BufferedDecoder(self)
         self.decoder.start()
 
         # TODO: inject sink functions
@@ -368,8 +367,7 @@ class AudioReader(threading.Thread):
                 if packet.ssrc not in self.client._ssrcs:
                     log.debug("Received packet for unknown ssrc %s", packet.ssrc)
 
-                if self.filter and self.filter(packet):
-                    self.decoder.feed_rtp(packet)
+                self.decoder.feed_rtp(packet)
 
     def stop(self):
         self._end.set()

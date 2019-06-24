@@ -38,6 +38,9 @@ import bisect
 import threading
 import traceback
 
+from collections import deque
+from bisect import insort
+
 from . import utils
 from .rtp import RTPPacket, RTCPPacket, SilencePacket, FECPacket
 from .errors import DiscordException
@@ -684,8 +687,7 @@ class BufferedPacketDecoder(BasePacketDecoder):
         self._decoder = Decoder()
         self._buffer = []
         self._rtcp_buffer = {} # TODO: Add RTCP queue
-        # self._last_seq = 0
-        self._last_ts = 0
+        self._last_seq = self._last_ts = 0
 
         # Optional diagnostic state stuff
         self._overflow_mult = self._overflow_base = 2.0
@@ -723,8 +725,7 @@ class BufferedPacketDecoder(BasePacketDecoder):
         with self._lock:
             self._decoder = Decoder() # TODO: Add a reset function to Decoder itself
             self.DELAY = self.__class__.DELAY
-            self._last_ts = 0
-            # self._last_seq = self._last_ts = 0
+            self._last_seq = self._last_ts = 0
             self._buffer.clear()
             self._rtcp_buffer.clear()
             self._gen.close()
@@ -792,12 +793,15 @@ class BufferedPacketDecoder(BasePacketDecoder):
 
         print(f"Starting with {pre_fill}, collecting {half_fill}, then {full_fill}")
 
-        for x in range(half_fill):
+        while not self._buffer:
+            yield None, None
+
+        for x in range(half_fill-1):
             yield None, None
 
         with self._lock:
             start_ts = self._buffer[0].timestamp
-            for x in range(1, 1 + self.buffer_size - len(buff)):
+            for x in range(1, 1 + self.buffer_size - len(self._buffer)):
                 self._push(SilencePacket(self.ssrc, start_ts + x * Decoder.SAMPLES_PER_FRAME))
 
         for x in range(full_fill):
@@ -806,7 +810,7 @@ class BufferedPacketDecoder(BasePacketDecoder):
         while True:
             packet, nextpacket = self._pop()
             self._last_ts = getattr(packet, 'timestamp', self._last_ts + Decoder.SAMPLES_PER_FRAME)
-            # self._last_seq += 1 # self._last_seq = packet.sequence?
+            self._last_seq += 1 # self._last_seq = packet.sequence?
 
             if isinstance(packet, RTPPacket):
                 pcm = self._decoder.decode(packet.decrypted_data)
@@ -841,18 +845,22 @@ class BufferedDecoder(threading.Thread):
         self.output_func = reader._write_to_sink
         self.decoders = {}
         self.initial_buffer = []
-        self.timers = []
+        self.queue = deque()
 
         self._end_thread = threading.Event()
+        self._has_decoder = threading.Event()
         self._lock = threading.Lock()
-        self._waiter = threading.Condition()
 
     def _get_decoder(self, ssrc):
         dec = self.decoders.get(ssrc)
-        if not dec and self.reader.client._get_ssrc_mapping(ssrc=ssrc)[1]: # and get_user(ssrc)
+
+        if not dec and self.reader.client._get_ssrc_mapping(ssrc=ssrc)[1]: # and get_user(ssrc)?
             dec = self.decoders[ssrc] = self.decodercls(ssrc)
-            dec.start_time = 0
-            dec.loops = 0
+            dec.start_time = time.perf_counter() # :thinking:
+            dec.loops = 0                        # :thinking::thinking::thinking:
+            self.queue.append((dec.start_time, dec))
+            self._has_decoder.set()
+
         return dec
 
     def _feed_rtp_initial(self, packet):
@@ -860,16 +868,27 @@ class BufferedDecoder(threading.Thread):
             self.initial_buffer.append(packet)
 
     def feed_rtp(self, packet):
-        self._get_decoder(packet.ssrc).feed_rtp(packet)
+        dec = self._get_decoder(packet.ssrc)
+        if dec:
+            return dec.feed_rtp(packet)
 
     def feed_rtcp(self, packet):
-        self._get_decoder(packet.ssrc).feed_rtcp(packet)
+        # RTCP packets themselves don't really belong to a decoder
+        # I could split the reports up or send to all idk its weird
+
+        dec = self._get_decoder(packet.ssrc)
+        if dec:
+            print(f"RTCP packet: {packet}")
+            return dec.feed_rtcp(packet)
 
     def drop_ssrc(self, ssrc):
         dec = self.decoders.pop(ssrc, None)
         if dec:
             # dec/self.flush()?
             dec.reset()
+
+            if not self.decoders:
+                self._has_decoder.clear()
 
     def reset(self, *ssrcs):
         with self._lock:
@@ -888,7 +907,8 @@ class BufferedDecoder(threading.Thread):
 
     def stop(self, **kwargs):
         for decoder in tuple(self.decoders.values()):
-            decoder.stop(**kwargs)
+            # decoder.stop(**kwargs)
+            decoder.reset()
 
     def _initial_fill(self):
         # Fill a single buffer first then dispense into the actual buffers
@@ -946,24 +966,32 @@ class BufferedDecoder(threading.Thread):
             self.feed_rtp = normal_feed_rtp
 
     def decode(self, decoder):
-        packet, pcm = next(decoder)
-        try:
-            self.output_func(pcm, packet.decrypted_data, packet)
-        except:
-            log.exception("Sink raised exception")
-            traceback.print_exc()
+        data = next(decoder)
+        if any(data):
+            packet, pcm = data
+            try:
+                self.output_func(pcm, packet.decrypted_data, packet)
+            except:
+                log.exception("Sink raised exception")
+                traceback.print_exc()
 
         decoder.loops += 1
-        decoder.next_time = decoder.start_time + self.DELAY * decoder.loops
-        self.timers.append((decoder.next_time, decoder))
+        decoder.next_time = decoder.start_time + decoder.DELAY * decoder.loops
+        self.queue.append((decoder.next_time, decoder))
 
     def _do_run(self):
         while not self._end_thread.is_set():
-            for decoder in tuple(self.decoders.values()):
-                # if time >= nexttime:
-                self.decode(decoder)
+            self._has_decoder.wait()
 
+            next_time, decoder = self.queue.popleft()
+            remaining = next_time - time.perf_counter()
 
+            if remaining >= 0:
+                insort(self.queue, (next_time, decoder))
+                time.sleep(max(0.002, remaining/2)) # sleep accuracy tm
+                continue
+
+            self.decode(decoder)
 
     def run(self):
         try:
@@ -971,28 +999,3 @@ class BufferedDecoder(threading.Thread):
         except Exception as e:
             log.exception("Error in decoder %s", self.name)
             traceback.print_exc()
-
-    def asfdasdfasdfasdfasdf(self):
-        self._primed.wait()
-        self._initial_fill()
-
-        self._loops = 0
-        packet_gen = self._packet_gen()
-        start_time = time.perf_counter()
-        try:
-            while not self._end_main_loop.is_set() or self._finalizing:
-                packet, pcm = next(packet_gen)
-                try:
-                    self.output_func(pcm, packet.decrypted_data, packet)
-                except:
-                    log.exception("Sink raised exception")
-                    traceback.print_exc()
-
-                next_time = start_time + self.DELAY * self._loops
-                self._loops += 1
-
-                time.sleep(max(0, self.DELAY + (next_time - time.perf_counter())))
-        except StopIteration:
-            time.sleep(0.001) # just in case, so we don't slam the cpu
-        finally:
-            packet_gen.close()
