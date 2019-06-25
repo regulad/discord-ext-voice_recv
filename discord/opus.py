@@ -713,7 +713,8 @@ class BufferedPacketDecoder(BasePacketDecoder):
 
     def feed_rtcp(self, packet):
         with self._lock:
-            # if buffer is empty...?
+            if not self._buffer:
+                return # ignore for now, handle properly later
             self._rtcp_buffer[self._buffer[-1]] = packet
 
     def truncate(self, *, size=None):
