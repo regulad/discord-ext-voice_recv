@@ -24,7 +24,7 @@ if version.endswith(('a', 'b', 'rc')):
 with open('README.md') as f:
     readme = f.read()
 
-setup(name='discord-ext-colours',
+setup(name='discord-ext-voice_recv',
       author='Imayhaveborkedit',
       url='https://github.com/imayhaveborkedit/discord.py/tree/voice-recv-protocol',
       version=version,
