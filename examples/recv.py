@@ -3,8 +3,7 @@ from discord.ext import commands, voice_recv
 
 discord.opus._load_default()
 
-bot = commands.Bot(command_prefix=commands.when_mentioned)
-
+bot = commands.Bot(command_prefix=commands.when_mentioned, intents=discord.Intents.all())
 
 class Testing(commands.Cog):
     def __init__(self, bot):
