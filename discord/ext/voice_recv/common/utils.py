@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 
-# May not even be needed if i dont use the dict subclasses
+# May not even be needed if i don't use the dict subclasses
 
 
 from collections import defaultdict
+
 
 class Bidict(dict):
     """A bi-directional dict"""
@@ -11,7 +12,7 @@ class Bidict(dict):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        super().update({v:k for k, v in self.items()})
+        super().update({v: k for k, v in self.items()})
 
     def __setitem__(self, key, value):
         # Delete related mappings
@@ -69,7 +70,7 @@ class Bidict(dict):
                 for k in E:
                     self[k] = E[k]
             else:
-                for k,v in E:
+                for k, v in E:
                     self[k] = v
         except IndexError:
             pass
@@ -84,7 +85,8 @@ class Bidict(dict):
     # https://docs.python.org/3/library/exceptions.html#NotImplementedError, Note 1
     fromkeys = None
 
-class Defaultdict(defaultdict):
+
+class DefaultDictImpl(defaultdict):
     def __missing__(self, key):
         if self.default_factory is None:
             raise KeyError((key,))

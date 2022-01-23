@@ -1,1 +1,1 @@
-discord.py[voice]>=1.7.3,<2.0.0
+discord.py[voice]@git+https://github.com/iDevision/enhanced-discord.py.git

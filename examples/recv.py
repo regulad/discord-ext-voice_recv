@@ -1,3 +1,5 @@
+import os
+
 import discord
 from discord.ext import commands, voice_recv
 
@@ -42,4 +44,4 @@ async def on_ready():
 
 
 bot.add_cog(Testing(bot))
-bot.run(token)
+bot.run(os.environ.get("TOKEN"))

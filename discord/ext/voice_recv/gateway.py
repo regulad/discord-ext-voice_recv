@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 
-import discord
 import asyncio
 
+import discord
 
-async def hook(self: discord.gateway.DiscordVoiceWebSocket, msg: dict):
+
+async def hook(self: "discord.gateway.DiscordVoiceWebSocket", msg: dict) -> None:
     op = msg['op']
     data = msg.get('d')
 
@@ -29,7 +30,8 @@ async def hook(self: discord.gateway.DiscordVoiceWebSocket, msg: dict):
     elif op == self.CLIENT_DISCONNECT:
         self._connection._remove_ssrc(user_id=int(data['user_id']))
 
-async def _do_hacks(self):
+
+async def _do_hacks(self: "discord.gateway.DiscordVoiceWebSocket") -> None:
     # Everything below this is a hack because discord keeps breaking things
 
     # hack #1
@@ -47,7 +49,6 @@ async def _do_hacks(self):
 
     # just so we don't have the speaking circle when we're not actually speaking
     await self.speak(False)
-
 
 # async def patched_received_message(self, msg):
 #     await self._orig_received_message(self, msg)

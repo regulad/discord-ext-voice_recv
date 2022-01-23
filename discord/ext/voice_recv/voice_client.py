@@ -1,21 +1,25 @@
 # -*- coding: utf-8 -*-
 
-import discord
 import threading
+from typing import Optional, Any
+
+import discord
+from discord import ClientException
 
 from .gateway import hook
 from .reader import AudioReader, AudioSink
 
+
 class VoiceRecvClient(discord.VoiceClient):
-    def __init__(self, client, channel):
+    def __init__(self, client: discord.Client, channel: discord.abc.Connectable) -> None:
         super().__init__(client, channel)
 
-        self._connecting = threading.Condition()
-        self._reader = None
-        self._ssrc_to_id = {}
-        self._id_to_ssrc = {}
+        self._connecting: threading.Condition = threading.Condition()
+        self._reader: Optional[AudioReader] = None
+        self._ssrc_to_id: dict[Any, int] = {}
+        self._id_to_ssrc: dict[int, Any] = {}
 
-    async def connect_websocket(self):
+    async def connect_websocket(self) -> None:
         ws = await discord.gateway.DiscordVoiceWebSocket.from_client(self, hook=hook)
         self._connected.clear()
         while ws.secret_key is None:
@@ -23,7 +27,7 @@ class VoiceRecvClient(discord.VoiceClient):
         self._connected.set()
         return ws
 
-    async def on_voice_state_update(self, data):
+    async def on_voice_state_update(self, data: "GuildVoiceStatePayload") -> None:
         await super().on_voice_state_update(data)
 
         channel_id = data['channel_id']
@@ -51,28 +55,27 @@ class VoiceRecvClient(discord.VoiceClient):
     #     await super().on_voice_server_update(data)
     #     ...
 
-
-    def cleanup(self):
+    def cleanup(self) -> None:
         super().cleanup()
         self.stop()
 
     # TODO: copy over new functions
     # add/remove/get ssrc
 
-    def _add_ssrc(self, user_id, ssrc):
+    def _add_ssrc(self, user_id: int, ssrc) -> None:
         self._ssrc_to_id[ssrc] = user_id
         self._id_to_ssrc[user_id] = ssrc
 
-    def _remove_ssrc(self, *, user_id):
+    def _remove_ssrc(self, *, user_id: int) -> None:
         ssrc = self._id_to_ssrc.pop(user_id, None)
         if ssrc:
             self._ssrc_to_id.pop(ssrc, None)
 
-    def _get_ssrc_mapping(self, *, ssrc):
+    def _get_ssrc_mapping(self, *, ssrc) -> tuple[Any, int]:
         uid = self._ssrc_to_id.get(ssrc)
         return ssrc, uid
 
-    def listen(self, sink):
+    def listen(self, sink: AudioSink) -> None:
         """Receives audio into a :class:`AudioSink`. TODO: wording"""
 
         if not self.is_connected():
@@ -87,37 +90,38 @@ class VoiceRecvClient(discord.VoiceClient):
         self._reader = AudioReader(sink, self)
         self._reader.start()
 
-    def is_listening(self):
+    def is_listening(self) -> bool:
         """Indicates if we're currently receiving audio."""
         return self._reader is not None and self._reader.is_listening()
 
-    def stop_listening(self):
+    def stop_listening(self) -> None:
         """Stops receiving audio."""
         if self._reader:
             self._reader.stop()
             self._reader = None
 
-    def stop_playing(self):
+    def stop_playing(self) -> None:
         """Stops playing audio."""
-        if self._player:
-            self._player.stop()
-            self._player = None
+        return super().stop()
 
-    def stop(self):
+    def stop(self) -> None:
         """Stops playing and receiving audio."""
         self.stop_playing()
         self.stop_listening()
 
     @property
-    def sink(self):
+    def sink(self) -> Optional[AudioSink]:
         return self._reader.sink if self._reader else None
 
     @sink.setter
-    def sink(self, value):
-        if not isinstance(value, AudioSink):
-            raise TypeError('expected AudioSink not {0.__class__.__name__}.'.format(value))
+    def sink(self, sink: AudioSink) -> None:
+        if not isinstance(sink, AudioSink):
+            raise TypeError('expected AudioSink not {0.__class__.__name__}.'.format(sink))
 
         if self._reader is None:
             raise ValueError('Not receiving anything.')
 
         self._reader._set_sink(sink)
+
+
+__all__: list[str] = ["VoiceRecvClient"]
